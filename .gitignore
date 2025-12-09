@@ -1,0 +1,10 @@
+.env
+*.exe
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+dist/
+build/
+.claude
