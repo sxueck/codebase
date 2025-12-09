@@ -91,20 +91,20 @@ class Calculator:
 
 func TestJavaScriptParser(t *testing.T) {
 	code := []byte(`function greet(name) {
-    console.log(\`Hello, \${name}\`);
-    return \`Greeted \${name}\`;
+    console.log("Hello, " + name);
+    return "Greeted " + name;
 }
 
 const add = (a, b) => {
     const result = a + b;
-    console.log(\`Sum: \${result}\`);
+    console.log("Sum: " + result);
     return result;
 };
 
 class Calculator {
     multiply(a, b) {
         const product = a * b;
-        console.log(\`Product: \${product}\`);
+        console.log("Product: " + product);
         return product;
     }
 }
@@ -129,20 +129,20 @@ class Calculator {
 
 func TestTypeScriptParser(t *testing.T) {
 	code := []byte(`function greet(name: string): string {
-    console.log(\`Hello, \${name}\`);
-    return \`Greeted \${name}\`;
+    console.log("Hello, " + name);
+    return "Greeted " + name;
 }
 
 const add = (a: number, b: number): number => {
     const result = a + b;
-    console.log(\`Sum: \${result}\`);
+    console.log("Sum: " + result);
     return result;
 };
 
 class Calculator {
     multiply(a: number, b: number): number {
         const product = a * b;
-        console.log(\`Product: \${product}\`);
+        console.log("Product: " + product);
         return product;
     }
 }

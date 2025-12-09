@@ -3,8 +3,8 @@ package parser
 import (
 	"fmt"
 
-	sitter "github.com/smacker/go-tree-sitter"
-	"github.com/smacker/go-tree-sitter/python"
+	sitter "github.com/tree-sitter/go-tree-sitter"
+	tree_sitter_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
 )
 
 // PythonParser implements LanguageParser for Python language
@@ -23,7 +23,7 @@ func (p *PythonParser) Language() string {
 // ExtractFunctions extracts function and class method definitions from Python source code
 func (p *PythonParser) ExtractFunctions(filePath string, code []byte) ([]FunctionNode, error) {
 	parser := sitter.NewParser()
-	parser.SetLanguage(python.GetLanguage())
+	parser.SetLanguage(sitter.NewLanguage(tree_sitter_python.Language()))
 
 	tree, err := parser.ParseCtx(nil, nil, code)
 	if err != nil {

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	sitter "github.com/smacker/go-tree-sitter"
-	"github.com/smacker/go-tree-sitter/golang"
+	sitter "github.com/tree-sitter/go-tree-sitter"
+	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
 )
 
 // GoParser implements LanguageParser for Go language
@@ -24,7 +24,7 @@ func (p *GoParser) Language() string {
 // ExtractFunctions extracts function and method definitions from Go source code
 func (p *GoParser) ExtractFunctions(filePath string, code []byte) ([]FunctionNode, error) {
 	parser := sitter.NewParser()
-	parser.SetLanguage(golang.GetLanguage())
+	parser.SetLanguage(sitter.NewLanguage(tree_sitter_go.Language()))
 
 	tree, err := parser.ParseCtx(nil, nil, code)
 	if err != nil {

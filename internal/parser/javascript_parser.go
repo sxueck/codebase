@@ -3,8 +3,8 @@ package parser
 import (
 	"fmt"
 
-	sitter "github.com/smacker/go-tree-sitter"
-	"github.com/smacker/go-tree-sitter/javascript"
+	sitter "github.com/tree-sitter/go-tree-sitter"
+	tree_sitter_javascript "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
 )
 
 // JavaScriptParser implements LanguageParser for JavaScript language
@@ -23,7 +23,7 @@ func (p *JavaScriptParser) Language() string {
 // ExtractFunctions extracts function, method, and arrow function definitions from JavaScript source code
 func (p *JavaScriptParser) ExtractFunctions(filePath string, code []byte) ([]FunctionNode, error) {
 	parser := sitter.NewParser()
-	parser.SetLanguage(javascript.GetLanguage())
+	parser.SetLanguage(sitter.NewLanguage(tree_sitter_javascript.Language()))
 
 	tree, err := parser.ParseCtx(nil, nil, code)
 	if err != nil {
