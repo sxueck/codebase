@@ -10,6 +10,35 @@ A powerful CLI tool for semantic code search and duplicate detection using vecto
 - **MCP Integration**: Model Context Protocol server for LLM integration
 - **Vector Database**: Uses Qdrant for efficient similarity search
 
+## Roadmap: AST-Aware Semantic Search
+
+This project already uses Go's built-in AST packages to extract function and method definitions for indexing. We plan to extend this further to get closer to tools like `claude-context` that use AST-based splitting for richer semantic understanding.
+
+Planned directions:
+
+- **Richer AST-Derived Metadata**
+  - For Go code (`internal/parser/go_parser.go`), extract and embed additional structural information:
+    - Package name and imports (e.g. `go/ast`, `go/parser`, `go/token`, `go/types`).
+    - Function signatures (parameter and return types).
+    - Method receiver types.
+    - Doc comments and key callees inside each function.
+  - Include these fields in the text we send to the embedding model so that queries like "where do we construct Go ASTs" can match based on imports and API usage, not just raw code text.
+
+- **AST-Based Code Chunking**
+  - Move beyond "one function = one chunk" by using AST structure to define more semantic chunks:
+    - Top-level declarations (functions, methods, types, etc.).
+    - File-level summary chunks that describe the purpose of a file, its imports, and exported symbols.
+    - Optional sub-chunking of very large functions by control-flow blocks.
+  - This mirrors the `AstCodeSplitter` approach used in `claude-context`, improving recall for module-level queries.
+
+- **Structure-Aware Query Planning and Filtering**
+  - Extend the query planning step (LLM-powered `QueryPlan`) to:
+    - Recognise structured signals in user queries (e.g. mentions of `go/ast`, `go/parser`, specific APIs).
+    - Generate sub-queries or filters that target files/functions with matching imports, languages, or node types.
+  - Store additional AST-derived fields (like imports or symbol names) in the vector payload, and use them in filter logic before ranking by semantic similarity.
+
+These changes aim to combine AST structure with vector search so that the system can answer more precise questions about where particular APIs, patterns, or language features are used in a codebase.
+
 ## Installation
 
 ```bash
