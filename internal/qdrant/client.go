@@ -1,37 +1,108 @@
 package qdrant
 
 import (
+	"codebase/internal/config"
 	"context"
+	"errors"
 	"fmt"
-	"os"
+	"net"
+	neturl "net/url"
+	"strconv"
+	"strings"
 
 	"github.com/qdrant/go-client/qdrant"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 type Client struct {
-	client       qdrant.PointsClient
-	collections  qdrant.CollectionsClient
-	grpcConn     *grpc.ClientConn
+	client      qdrant.PointsClient
+	collections qdrant.CollectionsClient
+	grpcConn    *grpc.ClientConn
 }
 
 func NewClient() (*Client, error) {
-	url := os.Getenv("QDRANT_URL")
-	if url == "" {
-		url = "localhost:6334"
+	addr := config.Get("QDRANT_URL", "qdrant_url")
+	host, port, err := parseQdrantAddress(addr)
+	if err != nil {
+		return nil, err
 	}
 
-	conn, err := grpc.Dial(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cfg := &qdrant.Config{
+		Host: host,
+		Port: port,
+	}
+
+	if apiKey := getQdrantAPIKey(); apiKey != "" {
+		cfg.APIKey = apiKey
+	}
+
+	grpcClient, err := qdrant.NewGrpcClient(cfg)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Client{
-		client:      qdrant.NewPointsClient(conn),
-		collections: qdrant.NewCollectionsClient(conn),
-		grpcConn:    conn,
+		client:      grpcClient.Points(),
+		collections: grpcClient.Collections(),
+		grpcConn:    grpcClient.Conn(),
 	}, nil
+}
+
+func parseQdrantAddress(raw string) (string, int, error) {
+	const (
+		defaultHost = "localhost"
+		defaultPort = 6334
+	)
+
+	if strings.TrimSpace(raw) == "" {
+		return defaultHost, defaultPort, nil
+	}
+
+	endpoint := strings.TrimSpace(raw)
+	if strings.Contains(endpoint, "://") {
+		parsed, err := neturl.Parse(endpoint)
+		if err != nil {
+			return "", 0, err
+		}
+		if parsed.Host == "" {
+			return defaultHost, defaultPort, nil
+		}
+		endpoint = parsed.Host
+	}
+
+	host, portStr, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		var addrErr *net.AddrError
+		if errors.As(err, &addrErr) && strings.Contains(addrErr.Err, "missing port") {
+			return endpoint, defaultPort, nil
+		}
+		return "", 0, err
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, err
+	}
+	if host == "" {
+		host = defaultHost
+	}
+
+	return host, port, nil
+}
+
+func getQdrantAPIKey() string {
+	return config.Get(
+		"QDRANT_API_KEY",
+		"qdrant_api_key",
+		"QDRANT_API_TOKEN",
+		"qdrant_api_token",
+		"QDRANT_AUTH_TOKEN",
+		"qdrant_auth_token",
+		"QDRANT_AUTH_PASSWORD",
+		"qdrant_auth_password",
+		"QDRANT_PASSWORD",
+		"qdrant_password",
+	)
 }
 
 func (c *Client) Close() error {

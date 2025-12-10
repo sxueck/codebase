@@ -1,22 +1,32 @@
 package llm
 
 import (
+	"codebase/internal/config"
 	"codebase/internal/models"
 	"context"
 	"encoding/json"
-	"os"
 
 	"github.com/sashabaranov/go-openai"
 )
 
 type Client struct {
 	client *openai.Client
+	model  string
 }
 
 func NewClient() *Client {
-	apiKey := os.Getenv("OPENAI_API_KEY")
+	apiKey := config.Get("OPENAI_API_KEY", "openai_key")
+	cfg := openai.DefaultConfig(apiKey)
+	if baseURL := config.Get("OPENAI_BASE_URL", "openai_base_url"); baseURL != "" {
+		cfg.BaseURL = baseURL
+	}
+	modelName := config.Get("OPENAI_LLM_MODEL", "openai_llm_model")
+	if modelName == "" {
+		modelName = openai.GPT4TurboPreview
+	}
 	return &Client{
-		client: openai.NewClient(apiKey),
+		client: openai.NewClientWithConfig(cfg),
+		model:  modelName,
 	}
 }
 
@@ -44,7 +54,7 @@ Intent类型说明:
 }`
 
 	resp, err := c.client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
-		Model: openai.GPT4TurboPreview,
+		Model: c.model,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 			{Role: openai.ChatMessageRoleUser, Content: query},
@@ -83,7 +93,7 @@ func (c *Client) ClassifyDuplicatePair(a, b models.CodeChunkPayload, score float
 }`
 
 	resp, err := c.client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
-		Model: openai.GPT4TurboPreview,
+		Model: c.model,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleUser, Content: prompt},
 		},

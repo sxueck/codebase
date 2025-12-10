@@ -2,10 +2,10 @@ package parser
 
 import (
 	"fmt"
-	"strings"
-
-	sitter "github.com/tree-sitter/go-tree-sitter"
-	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
+	"go/ast"
+	goparser "go/parser"
+	"go/token"
+	"go/types"
 )
 
 // GoParser implements LanguageParser for Go language
@@ -23,80 +23,68 @@ func (p *GoParser) Language() string {
 
 // ExtractFunctions extracts function and method definitions from Go source code
 func (p *GoParser) ExtractFunctions(filePath string, code []byte) ([]FunctionNode, error) {
-	parser := sitter.NewParser()
-	parser.SetLanguage(sitter.NewLanguage(tree_sitter_go.Language()))
-
-	tree, err := parser.ParseCtx(nil, nil, code)
+	fset := token.NewFileSet()
+	file, err := goparser.ParseFile(fset, filePath, code, goparser.ParseComments)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse Go code: %w", err)
 	}
-	defer tree.Close()
 
-	root := tree.RootNode()
 	var functions []FunctionNode
+	ast.Inspect(file, func(n ast.Node) bool {
+		decl, ok := n.(*ast.FuncDecl)
+		if !ok {
+			return true
+		}
 
-	// Query for function declarations and method declarations
-	p.traverseNode(root, code, filePath, &functions)
+		funcNode := p.buildFunctionNode(decl, code, fset)
+		if funcNode != nil && funcNode.EndLine-funcNode.StartLine >= 2 {
+			functions = append(functions, *funcNode)
+		}
+
+		return true
+	})
 
 	return functions, nil
 }
 
-func (p *GoParser) traverseNode(node *sitter.Node, code []byte, filePath string, functions *[]FunctionNode) {
-	nodeType := node.Type()
+func (p *GoParser) buildFunctionNode(decl *ast.FuncDecl, code []byte, fset *token.FileSet) *FunctionNode {
+	if decl == nil || decl.Name == nil {
+		return nil
+	}
 
-	// Check if this is a function or method declaration
-	if nodeType == "function_declaration" || nodeType == "method_declaration" {
-		funcNode := p.extractFunction(node, code, filePath, nodeType)
-		if funcNode != nil {
-			// Filter out very short functions (likely trivial getters/setters)
-			if funcNode.EndLine-funcNode.StartLine >= 2 {
-				*functions = append(*functions, *funcNode)
-			}
+	startPos := fset.PositionFor(decl.Pos(), false)
+	endPos := fset.PositionFor(decl.End(), false)
+	if startPos.Offset < 0 || endPos.Offset > len(code) || endPos.Offset <= startPos.Offset {
+		return nil
+	}
+
+	nodeType := "function_declaration"
+	name := decl.Name.Name
+
+	if decl.Recv != nil && len(decl.Recv.List) > 0 {
+		nodeType = "method_declaration"
+		recvType := formatReceiverType(decl.Recv.List[0].Type)
+		if recvType != "" {
+			name = fmt.Sprintf("(%s).%s", recvType, name)
 		}
 	}
 
-	// Recursively traverse child nodes
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		p.traverseNode(child, code, filePath, functions)
-	}
-}
-
-func (p *GoParser) extractFunction(node *sitter.Node, code []byte, filePath string, nodeType string) *FunctionNode {
-	startByte := node.StartByte()
-	endByte := node.EndByte()
-	startPoint := node.StartPoint()
-	endPoint := node.EndPoint()
-
-	// Extract function name
-	var name string
-	if nodeType == "function_declaration" {
-		nameNode := node.ChildByFieldName("name")
-		if nameNode != nil {
-			name = nameNode.Content(code)
-		}
-	} else if nodeType == "method_declaration" {
-		nameNode := node.ChildByFieldName("name")
-		if nameNode != nil {
-			name = nameNode.Content(code)
-		}
-		// Optionally include receiver type
-		receiverNode := node.ChildByFieldName("receiver")
-		if receiverNode != nil {
-			receiverText := receiverNode.Content(code)
-			name = fmt.Sprintf("%s.%s", strings.TrimSpace(receiverText), name)
-		}
-	}
-
-	content := string(code[startByte:endByte])
+	content := string(code[startPos.Offset:endPos.Offset])
 
 	return &FunctionNode{
 		Name:      name,
 		NodeType:  nodeType,
-		StartLine: int(startPoint.Row) + 1, // tree-sitter uses 0-indexed rows
-		EndLine:   int(endPoint.Row) + 1,
+		StartLine: startPos.Line,
+		EndLine:   endPos.Line,
 		Content:   content,
-		StartByte: int(startByte),
-		EndByte:   int(endByte),
+		StartByte: startPos.Offset,
+		EndByte:   endPos.Offset,
 	}
+}
+
+func formatReceiverType(expr ast.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	return types.ExprString(expr)
 }

@@ -1,9 +1,9 @@
 package embeddings
 
 import (
+	"codebase/internal/config"
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/sashabaranov/go-openai"
 )
@@ -14,10 +14,20 @@ type Client struct {
 }
 
 func NewClient() *Client {
-	apiKey := os.Getenv("OPENAI_API_KEY")
+	apiKey := config.Get("OPENAI_API_KEY", "openai_key")
+	cfg := openai.DefaultConfig(apiKey)
+	if baseURL := config.Get("OPENAI_BASE_URL", "openai_base_url"); baseURL != "" {
+		cfg.BaseURL = baseURL
+	}
+	modelName := config.Get("OPENAI_EMBEDDING_MODEL", "openai_embedding_model")
+	model := openai.SmallEmbedding3
+	if modelName != "" {
+		model = openai.EmbeddingModel(modelName)
+	}
+
 	return &Client{
-		client: openai.NewClient(apiKey),
-		model:  openai.SmallEmbedding3,
+		client: openai.NewClientWithConfig(cfg),
+		model:  model,
 	}
 }
 

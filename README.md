@@ -28,7 +28,11 @@ Set environment variables:
 
 ```bash
 export OPENAI_API_KEY=your_key_here
+export OPENAI_BASE_URL=https://api.openai.com/v1              # optional custom endpoint
+export OPENAI_EMBEDDING_MODEL=text-embedding-3-large          # optional embedding model
+export OPENAI_LLM_MODEL=gpt-4-turbo-preview                   # optional chat model
 export QDRANT_URL=localhost:6334
+export QDRANT_API_KEY=your_qdrant_password                    # optional auth secret
 ```
 
 ## Usage

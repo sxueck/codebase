@@ -9,8 +9,11 @@ import (
 	"codebase/internal/models"
 	"codebase/internal/qdrant"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 )
 
 type JSONRPCRequest struct {
@@ -64,16 +67,17 @@ func (s *Server) Run() error {
 	writer := bufio.NewWriter(os.Stdout)
 
 	for {
-		line, err := reader.ReadBytes('\n')
+		payload, err := readMessage(reader)
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			return err
+			s.writeError(writer, nil, -32700, err.Error())
+			continue
 		}
 
 		var req JSONRPCRequest
-		if err := json.Unmarshal(line, &req); err != nil {
+		if err := json.Unmarshal(payload, &req); err != nil {
 			s.writeError(writer, nil, -32700, "Parse error")
 			continue
 		}
@@ -92,8 +96,22 @@ func (s *Server) handleRequest(writer *bufio.Writer, req *JSONRPCRequest) {
 		s.handleToolsList(writer, req)
 	case "tools/call":
 		s.handleToolsCall(writer, req)
+	case "resources/list":
+		s.handleResourcesList(writer, req)
+	case "prompts/list":
+		s.handlePromptsList(writer, req)
+	case "ping":
+		s.handlePing(writer, req)
+	case "shutdown":
+		s.writeResponse(writer, req.ID, map[string]interface{}{})
+	case "notifications/initialized":
+		return
+	case "exit":
+		os.Exit(0)
 	default:
-		s.writeError(writer, req.ID, -32601, "Method not found")
+		if req.ID != nil {
+			s.writeError(writer, req.ID, -32601, "Method not found")
+		}
 	}
 }
 
@@ -105,10 +123,30 @@ func (s *Server) handleInitialize(writer *bufio.Writer, req *JSONRPCRequest) {
 			"version": "1.0.0",
 		},
 		"capabilities": map[string]interface{}{
-			"tools": map[string]bool{},
+			"tools":     map[string]interface{}{},
+			"resources": map[string]interface{}{},
+			"prompts":   map[string]interface{}{},
 		},
 	}
 	s.writeResponse(writer, req.ID, result)
+}
+
+func (s *Server) handleResourcesList(writer *bufio.Writer, req *JSONRPCRequest) {
+	s.writeResponse(writer, req.ID, map[string]interface{}{
+		"resources": []interface{}{},
+	})
+}
+
+func (s *Server) handlePromptsList(writer *bufio.Writer, req *JSONRPCRequest) {
+	s.writeResponse(writer, req.ID, map[string]interface{}{
+		"prompts": []interface{}{},
+	})
+}
+
+func (s *Server) handlePing(writer *bufio.Writer, req *JSONRPCRequest) {
+	s.writeResponse(writer, req.ID, map[string]interface{}{
+		"status": "ok",
+	})
 }
 
 func (s *Server) handleToolsList(writer *bufio.Writer, req *JSONRPCRequest) {
@@ -290,9 +328,7 @@ func (s *Server) writeResponse(writer *bufio.Writer, id interface{}, result inte
 		Result:  result,
 	}
 	data, _ := json.Marshal(resp)
-	writer.Write(data)
-	writer.WriteByte('\n')
-	writer.Flush()
+	writeMessage(writer, data)
 }
 
 func (s *Server) writeError(writer *bufio.Writer, id interface{}, code int, message string) {
@@ -305,12 +341,53 @@ func (s *Server) writeError(writer *bufio.Writer, id interface{}, code int, mess
 		},
 	}
 	data, _ := json.Marshal(resp)
-	writer.Write(data)
-	writer.WriteByte('\n')
-	writer.Flush()
+	writeMessage(writer, data)
 }
 
 func formatResult(result interface{}) string {
 	data, _ := json.MarshalIndent(result, "", "  ")
 	return string(data)
+}
+
+func readMessage(reader *bufio.Reader) ([]byte, error) {
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+
+		trimmed := strings.TrimRight(line, "\r\n")
+		if trimmed == "" {
+			continue
+		}
+
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "content-length:") {
+			value := strings.TrimSpace(trimmed[len("Content-Length:"):])
+			length, err := strconv.Atoi(value)
+			if err != nil {
+				return nil, fmt.Errorf("invalid Content-Length: %s", value)
+			}
+
+			// Expect blank line before payload.
+			if _, err := reader.ReadString('\n'); err != nil {
+				return nil, err
+			}
+
+			buf := make([]byte, length)
+			if _, err := io.ReadFull(reader, buf); err != nil {
+				return nil, err
+			}
+			return buf, nil
+		}
+
+		// Newline-delimited JSON (spec-compliant)
+		return []byte(trimmed), nil
+	}
+}
+
+func writeMessage(writer *bufio.Writer, data []byte) {
+	writer.Write(data)
+	writer.WriteByte('\n')
+	writer.Flush()
 }

@@ -1,10 +1,8 @@
 package parser
 
 import (
-	"fmt"
-
-	sitter "github.com/tree-sitter/go-tree-sitter"
-	tree_sitter_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
+	"regexp"
+	"strings"
 )
 
 // PythonParser implements LanguageParser for Python language
@@ -20,93 +18,152 @@ func (p *PythonParser) Language() string {
 	return string(LanguagePython)
 }
 
-// ExtractFunctions extracts function and class method definitions from Python source code
+var (
+	pyFuncRegex  = regexp.MustCompile(`^\s*def\s+([A-Za-z_]\w*)\s*\(`)
+	pyClassRegex = regexp.MustCompile(`^\s*class\s+([A-Za-z_]\w*)`)
+)
+
+type pythonLine struct {
+	text       string
+	indent     int
+	startByte  int
+	endByte    int
+	lineNumber int
+}
+
+type pythonBlock struct {
+	indent int
+	name   string
+}
+
+// ExtractFunctions extracts function and class method definitions from Python source code.
 func (p *PythonParser) ExtractFunctions(filePath string, code []byte) ([]FunctionNode, error) {
-	parser := sitter.NewParser()
-	parser.SetLanguage(sitter.NewLanguage(tree_sitter_python.Language()))
-
-	tree, err := parser.ParseCtx(nil, nil, code)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse Python code: %w", err)
-	}
-	defer tree.Close()
-
-	root := tree.RootNode()
+	lines := splitPythonLines(code)
 	var functions []FunctionNode
+	var classStack []pythonBlock
 
-	// Traverse the AST to find function and class definitions
-	p.traverseNode(root, code, filePath, "", &functions)
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line.text)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		for len(classStack) > 0 && line.indent <= classStack[len(classStack)-1].indent {
+			classStack = classStack[:len(classStack)-1]
+		}
+
+		if matches := pyClassRegex.FindStringSubmatch(line.text); matches != nil {
+			classStack = append(classStack, pythonBlock{
+				indent: line.indent,
+				name:   matches[1],
+			})
+			continue
+		}
+
+		if matches := pyFuncRegex.FindStringSubmatch(line.text); matches != nil {
+			name := matches[1]
+			nodeType := "function"
+			if len(classStack) > 0 {
+				nodeType = "method"
+				name = classStack[len(classStack)-1].name + "." + name
+			}
+
+			endIdx := findPythonBlockEnd(lines, i, line.indent)
+			startOffset := line.startByte
+			endOffset := lines[endIdx].endByte
+			if endOffset <= startOffset {
+				continue
+			}
+
+			startLine := line.lineNumber
+			endLine := lines[endIdx].lineNumber
+			if endLine-startLine < 2 {
+				continue
+			}
+
+			functions = append(functions, FunctionNode{
+				Name:      name,
+				NodeType:  nodeType,
+				StartLine: startLine,
+				EndLine:   endLine,
+				Content:   string(code[startOffset:endOffset]),
+				StartByte: startOffset,
+				EndByte:   endOffset,
+			})
+		}
+	}
 
 	return functions, nil
 }
 
-func (p *PythonParser) traverseNode(node *sitter.Node, code []byte, filePath string, className string, functions *[]FunctionNode) {
-	nodeType := node.Type()
-
-	// Check for function definitions
-	if nodeType == "function_definition" {
-		funcNode := p.extractFunction(node, code, filePath, className)
-		if funcNode != nil {
-			// Filter out very short functions
-			if funcNode.EndLine-funcNode.StartLine >= 2 {
-				*functions = append(*functions, *funcNode)
-			}
+func splitPythonLines(code []byte) []pythonLine {
+	var lines []pythonLine
+	start := 0
+	lineNumber := 1
+	for i := 0; i < len(code); i++ {
+		if code[i] == '\n' {
+			lines = append(lines, buildPythonLine(code, start, i+1, lineNumber))
+			start = i + 1
+			lineNumber++
 		}
 	}
-
-	// Check for class definitions to track context
-	if nodeType == "class_definition" {
-		nameNode := node.ChildByFieldName("name")
-		var currentClassName string
-		if nameNode != nil {
-			currentClassName = nameNode.Content(code)
-		}
-
-		// Recursively traverse class body with class context
-		for i := 0; i < int(node.ChildCount()); i++ {
-			child := node.Child(i)
-			p.traverseNode(child, code, filePath, currentClassName, functions)
-		}
-		return
+	if start < len(code) {
+		lines = append(lines, buildPythonLine(code, start, len(code), lineNumber))
+	} else if len(code) == 0 {
+		lines = append(lines, pythonLine{
+			text:       "",
+			indent:     0,
+			startByte:  0,
+			endByte:    0,
+			lineNumber: 1,
+		})
 	}
+	return lines
+}
 
-	// Recursively traverse child nodes
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		p.traverseNode(child, code, filePath, className, functions)
+func buildPythonLine(code []byte, start, end, lineNumber int) pythonLine {
+	length := end - start
+	text := code[start:end]
+	if length > 0 && text[length-1] == '\r' {
+		text = text[:length-1]
+	}
+	return pythonLine{
+		text:       string(text),
+		indent:     countPythonIndent(text),
+		startByte:  start,
+		endByte:    end,
+		lineNumber: lineNumber,
 	}
 }
 
-func (p *PythonParser) extractFunction(node *sitter.Node, code []byte, filePath string, className string) *FunctionNode {
-	startByte := node.StartByte()
-	endByte := node.EndByte()
-	startPoint := node.StartPoint()
-	endPoint := node.EndPoint()
-
-	// Extract function name
-	nameNode := node.ChildByFieldName("name")
-	if nameNode == nil {
-		return nil
+func countPythonIndent(line []byte) int {
+	count := 0
+	for _, b := range line {
+		if b == ' ' {
+			count++
+		} else if b == '\t' {
+			count += 4
+		} else {
+			break
+		}
 	}
+	return count
+}
 
-	name := nameNode.Content(code)
-
-	// Determine node type (function or method)
-	nodeTypeStr := "function"
-	if className != "" {
-		nodeTypeStr = "method"
-		name = fmt.Sprintf("%s.%s", className, name)
+func findPythonBlockEnd(lines []pythonLine, startIdx, indent int) int {
+	endIdx := startIdx
+	for i := startIdx + 1; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line.text)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			endIdx = i
+			continue
+		}
+		if line.indent <= indent {
+			break
+		}
+		endIdx = i
 	}
-
-	content := string(code[startByte:endByte])
-
-	return &FunctionNode{
-		Name:      name,
-		NodeType:  nodeTypeStr,
-		StartLine: int(startPoint.Row) + 1,
-		EndLine:   int(endPoint.Row) + 1,
-		Content:   content,
-		StartByte: int(startByte),
-		EndByte:   int(endByte),
-	}
+	return endIdx
 }

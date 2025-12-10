@@ -1,0 +1,826 @@
+package parser
+
+import (
+	"bytes"
+	"sort"
+	"unicode"
+)
+
+type jsFunctionExtractor struct {
+	code        []byte
+	tsAware     bool
+	pos         int
+	lineOffsets []int
+	functions   []FunctionNode
+}
+
+func extractJSFunctions(code []byte, tsAware bool) []FunctionNode {
+	extractor := &jsFunctionExtractor{
+		code:        code,
+		tsAware:     tsAware,
+		lineOffsets: buildLineOffsets(code),
+	}
+	extractor.scan()
+	return extractor.functions
+}
+
+func (e *jsFunctionExtractor) scan() {
+	for e.pos < len(e.code) {
+		if e.skipWhitespaceCommentsOrStrings() {
+			continue
+		}
+		if e.tryMatchClass() {
+			continue
+		}
+		if e.tryMatchFunction() {
+			continue
+		}
+		if e.tryMatchVariableFunction() {
+			continue
+		}
+		e.pos++
+	}
+}
+
+func (e *jsFunctionExtractor) tryMatchFunction() bool {
+	start := e.matchKeyword("function")
+	if start >= 0 {
+		return e.captureNamedFunction(start)
+	}
+
+	asyncStart := e.matchKeyword("async")
+	if asyncStart >= 0 {
+		e.skipWhitespaceComments()
+		innerStart := e.matchKeyword("function")
+		if innerStart >= 0 {
+			return e.captureNamedFunction(asyncStart)
+		}
+		e.pos = asyncStart + len("async")
+	}
+
+	return false
+}
+
+func (e *jsFunctionExtractor) tryMatchClass() bool {
+	start := e.matchKeyword("class")
+	if start < 0 {
+		return false
+	}
+
+	className := ""
+	e.skipWhitespaceComments()
+	name, ok := e.readIdentifier()
+	if ok {
+		className = name
+	}
+
+	e.skipWhitespaceComments()
+	// Skip extends clause if present
+	lookahead := e.matchKeyword("extends")
+	if lookahead >= 0 {
+		e.skipBalancedExpression()
+		e.skipWhitespaceComments()
+	}
+
+	if e.pos >= len(e.code) || e.code[e.pos] != '{' {
+		return false
+	}
+
+	bodyStart := e.pos
+	bodyEnd := e.scanBalanced(bodyStart, '{', '}')
+	if bodyEnd < 0 {
+		return false
+	}
+	e.extractClassMethods(className, bodyStart, bodyEnd)
+	e.pos = bodyEnd
+	return true
+}
+
+func (e *jsFunctionExtractor) tryMatchVariableFunction() bool {
+	start := e.matchAnyKeyword("const", "let", "var")
+	if start < 0 {
+		return false
+	}
+
+	funcStart := start
+	e.skipWhitespaceComments()
+
+	name, ok := e.readIdentifier()
+	if !ok {
+		return false
+	}
+
+	e.skipWhitespaceComments()
+	if e.pos >= len(e.code) || e.code[e.pos] != '=' {
+		return false
+	}
+	e.pos++
+	e.skipWhitespaceComments()
+
+	// Allow async arrow functions
+	if asyncStart := e.matchKeyword("async"); asyncStart >= 0 {
+		e.skipWhitespaceComments()
+		funcStart = start
+		_ = asyncStart
+	}
+
+	if e.lookaheadKeyword("function") {
+		e.matchKeyword("function")
+		return e.captureFunctionExpression(funcStart, name)
+	}
+
+	return e.captureArrowFunction(funcStart, name)
+}
+
+func (e *jsFunctionExtractor) captureNamedFunction(start int) bool {
+	funcStart := start
+	e.skipWhitespaceComments()
+	if e.pos < len(e.code) && e.code[e.pos] == '*' {
+		e.pos++
+		e.skipWhitespaceComments()
+	}
+
+	name, ok := e.readIdentifier()
+	if !ok {
+		return false
+	}
+
+	e.skipWhitespaceComments()
+	if e.pos >= len(e.code) || e.code[e.pos] != '(' {
+		return false
+	}
+
+	paramsEnd := e.scanBalanced(e.pos, '(', ')')
+	if paramsEnd < 0 {
+		return false
+	}
+	e.pos = paramsEnd
+	e.skipWhitespaceComments()
+	e.skipOptionalTypeAnnotation()
+	e.skipWhitespaceComments()
+
+	if e.pos >= len(e.code) || e.code[e.pos] != '{' {
+		return false
+	}
+
+	bodyEnd := e.scanBalanced(e.pos, '{', '}')
+	if bodyEnd < 0 {
+		return false
+	}
+
+	e.appendFunction(name, "function", funcStart, bodyEnd)
+	e.pos = bodyEnd
+	return true
+}
+
+func (e *jsFunctionExtractor) captureFunctionExpression(start int, name string) bool {
+	e.skipWhitespaceComments()
+	if e.pos < len(e.code) && isIdentifierStart(e.code[e.pos]) {
+		// Skip optional inner name
+		e.readIdentifier()
+	}
+
+	e.skipWhitespaceComments()
+	if e.pos >= len(e.code) || e.code[e.pos] != '(' {
+		return false
+	}
+
+	paramsEnd := e.scanBalanced(e.pos, '(', ')')
+	if paramsEnd < 0 {
+		return false
+	}
+	e.pos = paramsEnd
+	e.skipWhitespaceComments()
+	e.skipOptionalTypeAnnotation()
+	e.skipWhitespaceComments()
+
+	if e.pos >= len(e.code) || e.code[e.pos] != '{' {
+		return false
+	}
+
+	bodyEnd := e.scanBalanced(e.pos, '{', '}')
+	if bodyEnd < 0 {
+		return false
+	}
+
+	e.appendFunction(name, "function", start, bodyEnd)
+	e.pos = bodyEnd
+	return true
+}
+
+func (e *jsFunctionExtractor) captureArrowFunction(start int, name string) bool {
+	paramStart := e.pos
+	if e.pos < len(e.code) && e.code[e.pos] == '(' {
+		paramsEnd := e.scanBalanced(e.pos, '(', ')')
+		if paramsEnd < 0 {
+			return false
+		}
+		e.pos = paramsEnd
+	} else {
+		_, ok := e.readIdentifier()
+		if !ok {
+			return false
+		}
+	}
+
+	e.skipWhitespaceComments()
+	e.skipOptionalTypeAnnotation()
+	e.skipWhitespaceComments()
+
+	if e.pos+1 >= len(e.code) || e.code[e.pos] != '=' || e.code[e.pos+1] != '>' {
+		e.pos = paramStart
+		return false
+	}
+	e.pos += 2
+	e.skipWhitespaceComments()
+
+	if e.pos >= len(e.code) || e.code[e.pos] != '{' {
+		return false
+	}
+
+	bodyEnd := e.scanBalanced(e.pos, '{', '}')
+	if bodyEnd < 0 {
+		return false
+	}
+
+	e.appendFunction(name, "function", start, bodyEnd)
+	e.pos = bodyEnd
+	return true
+}
+
+func (e *jsFunctionExtractor) extractClassMethods(className string, bodyStart, bodyEnd int) {
+	pos := bodyStart + 1
+	for pos < bodyEnd {
+		e.pos = pos
+		if e.skipWhitespaceCommentsOrStrings() {
+			pos = e.pos
+			continue
+		}
+
+		start := e.pos
+		e.skipDecorators()
+		e.skipWhitespaceComments()
+		for {
+			if kw := e.matchAnyKeyword("public", "private", "protected", "static", "async", "get", "set", "readonly", "override", "abstract"); kw >= 0 {
+				e.skipWhitespaceComments()
+				continue
+			}
+			break
+		}
+
+		if e.pos >= len(e.code) {
+			break
+		}
+
+		if e.code[e.pos] == '*' {
+			e.pos++
+			e.skipWhitespaceComments()
+		}
+
+		methodName := ""
+		if e.pos < len(e.code) && e.code[e.pos] == '#' {
+			e.pos++
+		}
+
+		if e.pos < len(e.code) && e.code[e.pos] == '[' {
+			end := e.scanBalanced(e.pos, '[', ']')
+			if end < 0 {
+				break
+			}
+			e.pos = end
+			e.skipWhitespaceComments()
+		} else {
+			name, ok := e.readIdentifier()
+			if !ok {
+				pos = start + 1
+				continue
+			}
+			methodName = name
+		}
+
+		e.skipWhitespaceComments()
+		if e.pos >= len(e.code) {
+			break
+		}
+
+		if e.code[e.pos] != '(' {
+			pos = start + 1
+			continue
+		}
+
+		paramsEnd := e.scanBalanced(e.pos, '(', ')')
+		if paramsEnd < 0 {
+			break
+		}
+		e.pos = paramsEnd
+		e.skipWhitespaceComments()
+		e.skipOptionalTypeAnnotation()
+		e.skipWhitespaceComments()
+
+		if e.pos >= len(e.code) || e.code[e.pos] != '{' {
+			pos = start + 1
+			continue
+		}
+
+		methodEnd := e.scanBalanced(e.pos, '{', '}')
+		if methodEnd < 0 {
+			break
+		}
+
+		funcName := methodName
+		if className != "" && funcName != "" {
+			funcName = className + "." + funcName
+		}
+		if funcName == "" {
+			funcName = className
+		}
+
+		e.appendFunction(funcName, "method", start, methodEnd)
+		pos = methodEnd
+	}
+}
+
+func (e *jsFunctionExtractor) skipDecorators() {
+	for {
+		e.skipWhitespaceComments()
+		if e.pos >= len(e.code) || e.code[e.pos] != '@' {
+			return
+		}
+		e.pos++
+		for e.pos < len(e.code) {
+			ch := e.code[e.pos]
+			if ch == '\n' || ch == '\r' {
+				e.pos++
+				break
+			}
+			if ch == '(' {
+				end := e.scanBalanced(e.pos, '(', ')')
+				if end < 0 {
+					return
+				}
+				e.pos = end
+			} else {
+				e.pos++
+			}
+		}
+	}
+}
+
+func (e *jsFunctionExtractor) skipWhitespaceComments() {
+	for e.pos < len(e.code) {
+		switch e.code[e.pos] {
+		case ' ', '\t', '\r', '\n':
+			e.pos++
+		case '/':
+			if e.pos+1 < len(e.code) {
+				next := e.code[e.pos+1]
+				if next == '/' {
+					e.pos += 2
+					for e.pos < len(e.code) && e.code[e.pos] != '\n' {
+						e.pos++
+					}
+				} else if next == '*' {
+					e.pos += 2
+					for e.pos+1 < len(e.code) && !(e.code[e.pos] == '*' && e.code[e.pos+1] == '/') {
+						e.pos++
+					}
+					if e.pos+1 < len(e.code) {
+						e.pos += 2
+					}
+				} else {
+					return
+				}
+			} else {
+				return
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (e *jsFunctionExtractor) skipWhitespaceCommentsOrStrings() bool {
+	if e.pos >= len(e.code) {
+		return false
+	}
+
+	switch e.code[e.pos] {
+	case ' ', '\t', '\r', '\n':
+		e.skipWhitespaceComments()
+		return true
+	case '/':
+		before := e.pos
+		e.skipWhitespaceComments()
+		return before != e.pos
+	case '"', '\'':
+		e.skipStringLiteral(e.code[e.pos])
+		return true
+	case '`':
+		e.skipTemplateLiteral()
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *jsFunctionExtractor) skipStringLiteral(quote byte) {
+	if e.pos >= len(e.code) {
+		return
+	}
+	e.pos++
+	for e.pos < len(e.code) {
+		ch := e.code[e.pos]
+		if ch == '\\' {
+			e.pos += 2
+			continue
+		}
+		e.pos++
+		if ch == quote {
+			break
+		}
+	}
+}
+
+func (e *jsFunctionExtractor) skipTemplateLiteral() {
+	if e.pos >= len(e.code) || e.code[e.pos] != '`' {
+		return
+	}
+	e.pos++
+	for e.pos < len(e.code) {
+		ch := e.code[e.pos]
+		if ch == '\\' {
+			e.pos += 2
+			continue
+		}
+		if ch == '`' {
+			e.pos++
+			break
+		}
+		if ch == '$' && e.pos+1 < len(e.code) && e.code[e.pos+1] == '{' {
+			blockEnd := e.scanBalanced(e.pos+1, '{', '}')
+			if blockEnd < 0 {
+				e.pos = len(e.code)
+				return
+			}
+			e.pos = blockEnd
+			continue
+		}
+		e.pos++
+	}
+}
+
+func (e *jsFunctionExtractor) skipBalancedExpression() {
+	depth := 0
+	for e.pos < len(e.code) {
+		ch := e.code[e.pos]
+		switch ch {
+		case '{', '(', '[':
+			depth++
+		case '}', ')', ']':
+			if depth == 0 {
+				return
+			}
+			depth--
+		case '"', '\'':
+			e.skipStringLiteral(ch)
+			continue
+		case '`':
+			e.skipTemplateLiteral()
+			continue
+		}
+		e.pos++
+		if depth == 0 && (ch == '{' || ch == '(' || ch == '[') {
+			break
+		}
+	}
+}
+
+func (e *jsFunctionExtractor) scanBalanced(start int, open, close byte) int {
+	if start >= len(e.code) || e.code[start] != open {
+		return -1
+	}
+	pos := start
+	depth := 0
+	for pos < len(e.code) {
+		ch := e.code[pos]
+		if ch == open {
+			depth++
+			pos++
+			continue
+		}
+		if ch == close {
+			depth--
+			pos++
+			if depth == 0 {
+				return pos
+			}
+			continue
+		}
+		switch ch {
+		case '"', '\'':
+			pos = skipStringLiteralFrom(e.code, pos)
+		case '`':
+			pos = skipTemplateLiteralFrom(e.code, pos)
+		case '/':
+			next := skipCommentFrom(e.code, pos)
+			if next == pos {
+				pos++
+			} else {
+				pos = next
+			}
+		default:
+			pos++
+		}
+	}
+	return -1
+}
+
+func (e *jsFunctionExtractor) skipOptionalTypeAnnotation() {
+	if !e.tsAware {
+		return
+	}
+	if e.pos >= len(e.code) || e.code[e.pos] != ':' {
+		return
+	}
+
+	e.pos++
+	depth := 0
+	firstToken := true
+	for e.pos < len(e.code) {
+		ch := e.code[e.pos]
+		switch ch {
+		case ' ', '\t', '\r':
+			e.pos++
+			continue
+		}
+		if ch == '\n' && depth == 0 {
+			return
+		}
+		if firstToken && ch != '\n' {
+			firstToken = false
+		}
+		switch ch {
+		case '{':
+			if depth == 0 && !firstToken {
+				return
+			}
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			} else {
+				return
+			}
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			}
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case '[':
+			depth++
+		case ']':
+			if depth > 0 {
+				depth--
+			}
+		case '"', '\'':
+			e.skipStringLiteral(ch)
+			continue
+		case '`':
+			e.skipTemplateLiteral()
+			continue
+		case '\n', ';':
+			if depth == 0 {
+				return
+			}
+		case '=':
+			if depth == 0 {
+				return
+			}
+		}
+		e.pos++
+	}
+}
+
+func (e *jsFunctionExtractor) matchKeyword(word string) int {
+	if e.pos < 0 || e.pos+len(word) > len(e.code) {
+		return -1
+	}
+	if !bytes.HasPrefix(e.code[e.pos:], []byte(word)) {
+		return -1
+	}
+	if !e.keywordBoundaryBefore(e.pos) {
+		return -1
+	}
+	after := e.pos + len(word)
+	if after < len(e.code) && isIdentifierPart(e.code[after]) {
+		return -1
+	}
+	start := e.pos
+	e.pos = after
+	return start
+}
+
+func (e *jsFunctionExtractor) matchAnyKeyword(words ...string) int {
+	for _, word := range words {
+		saved := e.pos
+		if pos := e.matchKeyword(word); pos >= 0 {
+			return pos
+		}
+		e.pos = saved
+	}
+	return -1
+}
+
+func (e *jsFunctionExtractor) keywordBoundaryBefore(pos int) bool {
+	if pos == 0 {
+		return true
+	}
+	return !isIdentifierPart(e.code[pos-1])
+}
+
+func (e *jsFunctionExtractor) lookaheadKeyword(word string) bool {
+	saved := e.pos
+	defer func() { e.pos = saved }()
+	return e.matchKeyword(word) >= 0
+}
+
+func (e *jsFunctionExtractor) readIdentifier() (string, bool) {
+	if e.pos >= len(e.code) {
+		return "", false
+	}
+	if !isIdentifierStart(e.code[e.pos]) {
+		return "", false
+	}
+	start := e.pos
+	e.pos++
+	for e.pos < len(e.code) && isIdentifierPart(e.code[e.pos]) {
+		e.pos++
+	}
+	return string(e.code[start:e.pos]), true
+}
+
+func (e *jsFunctionExtractor) appendFunction(name, nodeType string, start, end int) {
+	if end <= start {
+		return
+	}
+	startLine := e.lineForOffset(start)
+	endLine := e.lineForOffset(end - 1)
+	if endLine-startLine < 2 {
+		return
+	}
+	content := string(e.code[start:end])
+	e.functions = append(e.functions, FunctionNode{
+		Name:      name,
+		NodeType:  nodeType,
+		StartLine: startLine,
+		EndLine:   endLine,
+		Content:   content,
+		StartByte: start,
+		EndByte:   end,
+	})
+}
+
+func (e *jsFunctionExtractor) lineForOffset(offset int) int {
+	if offset < 0 {
+		return 1
+	}
+	idx := sort.Search(len(e.lineOffsets), func(i int) bool {
+		return e.lineOffsets[i] > offset
+	})
+	if idx == 0 {
+		return 1
+	}
+	return idx
+}
+
+func buildLineOffsets(code []byte) []int {
+	offsets := []int{0}
+	for i, b := range code {
+		if b == '\n' {
+			offsets = append(offsets, i+1)
+		}
+	}
+	offsets = append(offsets, len(code)+1)
+	return offsets
+}
+
+func isIdentifierStart(ch byte) bool {
+	return ch == '_' || ch == '$' || unicode.IsLetter(rune(ch))
+}
+
+func isIdentifierPart(ch byte) bool {
+	return ch == '_' || ch == '$' || unicode.IsLetter(rune(ch)) || unicode.IsDigit(rune(ch))
+}
+
+func skipStringLiteralFrom(code []byte, pos int) int {
+	quote := code[pos]
+	pos++
+	for pos < len(code) {
+		ch := code[pos]
+		if ch == '\\' {
+			pos += 2
+			continue
+		}
+		pos++
+		if ch == quote {
+			break
+		}
+	}
+	return pos
+}
+
+func skipTemplateLiteralFrom(code []byte, pos int) int {
+	pos++
+	for pos < len(code) {
+		ch := code[pos]
+		if ch == '\\' {
+			pos += 2
+			continue
+		}
+		if ch == '`' {
+			pos++
+			break
+		}
+		if ch == '$' && pos+1 < len(code) && code[pos+1] == '{' {
+			blockEnd := skipBalancedFrom(code, pos+1, '{', '}')
+			if blockEnd < 0 {
+				return len(code)
+			}
+			pos = blockEnd
+			continue
+		}
+		pos++
+	}
+	return pos
+}
+
+func skipCommentFrom(code []byte, pos int) int {
+	if pos+1 >= len(code) {
+		return pos
+	}
+	if code[pos+1] == '/' {
+		pos += 2
+		for pos < len(code) && code[pos] != '\n' {
+			pos++
+		}
+		return pos
+	}
+	if code[pos+1] == '*' {
+		pos += 2
+		for pos+1 < len(code) && !(code[pos] == '*' && code[pos+1] == '/') {
+			pos++
+		}
+		if pos+1 < len(code) {
+			pos += 2
+		}
+		return pos
+	}
+	return pos
+}
+
+func skipBalancedFrom(code []byte, start int, open, close byte) int {
+	if start >= len(code) || code[start] != open {
+		return -1
+	}
+	pos := start
+	depth := 0
+	for pos < len(code) {
+		ch := code[pos]
+		if ch == open {
+			depth++
+			pos++
+			continue
+		}
+		if ch == close {
+			depth--
+			pos++
+			if depth == 0 {
+				return pos
+			}
+			continue
+		}
+		switch ch {
+		case '"', '\'':
+			pos = skipStringLiteralFrom(code, pos)
+		case '`':
+			pos = skipTemplateLiteralFrom(code, pos)
+		case '/':
+			next := skipCommentFrom(code, pos)
+			if next == pos {
+				pos++
+			} else {
+				pos = next
+			}
+		default:
+			pos++
+		}
+	}
+	return -1
+}
