@@ -3,6 +3,7 @@ package mcp
 import (
 	"bufio"
 	"codebase/internal/analyzer"
+	"codebase/internal/config"
 	"codebase/internal/embeddings"
 	"codebase/internal/indexer"
 	"codebase/internal/llm"
@@ -12,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -35,6 +37,19 @@ type RPCError struct {
 	Message string `json:"message"`
 }
 
+// SearchResult holds a code chunk with its fusion score for multi-query recall
+type SearchResult struct {
+	models.CodeChunkPayload
+	FusionScore float64
+	Rank        int
+}
+
+// QueryPlan alias for models.QueryPlan
+type QueryPlan = models.QueryPlan
+
+// CodeChunkPayload alias for models.CodeChunkPayload
+type CodeChunkPayload = models.CodeChunkPayload
+
 type Server struct {
 	qdrantClient *qdrant.Client
 	embedClient  *embeddings.Client
@@ -43,6 +58,14 @@ type Server struct {
 }
 
 func NewServer() (*Server, error) {
+	// Best-effort load of shared config from ~/.codebase/config.json.
+	// Values from this file are applied as environment variables (if not
+	// already set) so that downstream clients can use the standard config
+	// layer based on env vars.
+	if err := config.LoadFromUserConfig(); err != nil {
+		return nil, err
+	}
+
 	qc, err := qdrant.NewClient()
 	if err != nil {
 		return nil, err
@@ -152,38 +175,19 @@ func (s *Server) handlePing(writer *bufio.Writer, req *JSONRPCRequest) {
 func (s *Server) handleToolsList(writer *bufio.Writer, req *JSONRPCRequest) {
 	tools := []map[string]interface{}{
 		{
-			"name":        "search_code",
-			"description": "Search codebase using natural language query",
+			"name":        "codebase-retrieval",
+			"description": "Semantic code search over this repository's indexed codebase. Use this whenever you need to read or understand existing code before answering a question or proposing changes. Given a natural language query, it returns the most relevant code snippets and their file paths so you can ground your reasoning in the real project instead of guessing.",
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"query": map[string]string{"type": "string"},
-					"top_k": map[string]string{"type": "integer"},
-				},
-				"required": []string{"query"},
-			},
-		},
-		{
-			"name":        "find_redundant_code",
-			"description": "Find duplicate or redundant code in the codebase",
-			"inputSchema": map[string]interface{}{
-				"type": "object",
-				"properties": map[string]interface{}{
-					"threshold": map[string]string{"type": "number"},
-					"languages": map[string]interface{}{
-						"type":  "array",
-						"items": map[string]string{"type": "string"},
+					"query": map[string]interface{}{
+						"type":        "string",
+						"description": "Natural language description of what you want to find in this codebase. Prefer rich, specific queries that mention languages, frameworks, symbols, file paths, or behaviors (for example: 'Go handler that serves the search API', 'where we call the Qdrant client for semantic search', or 'all code that parses TypeScript files'). Use this tool whenever the user asks about existing behavior, architecture, or how something is implemented.",
 					},
-				},
-			},
-		},
-		{
-			"name":        "code_query",
-			"description": "Universal natural language code query interface",
-			"inputSchema": map[string]interface{}{
-				"type": "object",
-				"properties": map[string]interface{}{
-					"query": map[string]string{"type": "string"},
+					"top_k": map[string]interface{}{
+						"type":        "integer",
+						"description": "Maximum number of code snippets to return (default 10). Increase this when you need broader coverage of the relevant implementation (for example, 20–50 when exploring a feature area) and lower it when you only need the single most relevant location.",
+					},
 				},
 				"required": []string{"query"},
 			},
@@ -207,12 +211,8 @@ func (s *Server) handleToolsCall(writer *bufio.Writer, req *JSONRPCRequest) {
 	var err error
 
 	switch params.Name {
-	case "search_code":
-		result, err = s.handleSearchCode(params.Arguments)
-	case "find_redundant_code":
-		result, err = s.handleFindRedundant(params.Arguments)
-	case "code_query":
-		result, err = s.handleCodeQuery(params.Arguments)
+	case "codebase-retrieval":
+		result, err = s.handleCodebaseRetrieval(params.Arguments)
 	default:
 		s.writeError(writer, req.ID, -32602, "Unknown tool")
 		return
@@ -233,6 +233,10 @@ func (s *Server) handleToolsCall(writer *bufio.Writer, req *JSONRPCRequest) {
 	})
 }
 
+func (s *Server) handleCodebaseRetrieval(args json.RawMessage) (interface{}, error) {
+	return s.handleSearchCode(args)
+}
+
 func (s *Server) handleSearchCode(args json.RawMessage) (interface{}, error) {
 	var input struct {
 		Query string `json:"query"`
@@ -246,12 +250,33 @@ func (s *Server) handleSearchCode(args json.RawMessage) (interface{}, error) {
 		input.TopK = 10
 	}
 
-	vec, err := s.embedClient.Embed(input.Query)
+	// Step 1: Use LLM to build QueryPlan (intent recognition and query rewriting)
+	plan, err := s.llmClient.BuildQueryPlan(input.Query)
+	if err != nil {
+		// Fallback to simple search if LLM fails
+		return s.simpleSearch(input.Query, input.TopK)
+	}
+
+	// Step 2: Branch based on intent type
+	switch plan.Intent {
+	case "DUPLICATE":
+		return s.handleDuplicateIntent(plan)
+	case "SEARCH", "REFACTOR", "BUG_PATTERN":
+		return s.handleSemanticIntent(plan, input.TopK)
+	default:
+		// Unknown intent, fallback to simple search
+		return s.simpleSearch(input.Query, input.TopK)
+	}
+}
+
+// simpleSearch performs basic semantic search without query planning
+func (s *Server) simpleSearch(query string, topK int) (interface{}, error) {
+	vec, err := s.embedClient.Embed(query)
 	if err != nil {
 		return nil, err
 	}
 
-	results, err := s.qdrantClient.Search(indexer.CollectionName, vec, uint64(input.TopK))
+	results, err := s.qdrantClient.Search(indexer.CollectionName, vec, uint64(topK))
 	if err != nil {
 		return nil, err
 	}
@@ -259,66 +284,143 @@ func (s *Server) handleSearchCode(args json.RawMessage) (interface{}, error) {
 	return results, nil
 }
 
-func (s *Server) handleFindRedundant(args json.RawMessage) (interface{}, error) {
-	var input struct {
-		Threshold float64  `json:"threshold"`
-		Languages []string `json:"languages"`
-	}
-	if err := json.Unmarshal(args, &input); err != nil {
-		return nil, err
-	}
-
-	if input.Threshold == 0 {
-		input.Threshold = 0.92
-	}
-
-	plan := models.QueryPlan{
-		Intent:     models.IntentDuplicate,
-		SubQueries: []string{},
-		Filter: models.QueryFilter{
-			Languages: input.Languages,
-			NodeTypes: []string{"function", "method"},
-			MinLines:  5,
-			MaxLines:  300,
-		},
-		Threshold: input.Threshold,
-	}
-
-	groups, err := s.analyzer.FindDuplicates(plan)
+// handleDuplicateIntent processes duplicate detection queries
+func (s *Server) handleDuplicateIntent(plan *QueryPlan) (interface{}, error) {
+	duplicates, err := s.analyzer.FindDuplicates(*plan)
 	if err != nil {
 		return nil, err
 	}
 
-	return groups, nil
+	return map[string]interface{}{
+		"intent":     "DUPLICATE",
+		"duplicates": duplicates,
+	}, nil
 }
 
-func (s *Server) handleCodeQuery(args json.RawMessage) (interface{}, error) {
-	var input struct {
-		Query string `json:"query"`
-	}
-	if err := json.Unmarshal(args, &input); err != nil {
-		return nil, err
+// handleSemanticIntent processes semantic search with multi-query recall and fusion
+func (s *Server) handleSemanticIntent(plan *QueryPlan, topK int) (interface{}, error) {
+	if len(plan.SubQueries) == 0 {
+		return nil, fmt.Errorf("no sub-queries in plan")
 	}
 
-	plan, err := s.llmClient.BuildQueryPlan(input.Query)
-	if err != nil {
-		return nil, err
-	}
+	// Multi-query recall: embed and search each sub-query
+	allResults := make(map[string]*SearchResult)
 
-	switch plan.Intent {
-	case models.IntentSearch:
-		vec, err := s.embedClient.Embed(input.Query)
+	for _, subQuery := range plan.SubQueries {
+		vec, err := s.embedClient.Embed(subQuery)
 		if err != nil {
-			return nil, err
+			continue // Skip failed embeddings
 		}
-		return s.qdrantClient.Search(indexer.CollectionName, vec, 10)
 
-	case models.IntentDuplicate:
-		return s.analyzer.FindDuplicates(*plan)
+		scoredPoints, err := s.qdrantClient.Search(indexer.CollectionName, vec, uint64(topK*2))
+		if err != nil {
+			continue // Skip failed searches
+		}
 
-	default:
-		return map[string]string{"status": "intent not implemented"}, nil
+		// Merge results with reciprocal rank fusion
+		for _, point := range scoredPoints {
+			// Extract payload as CodeChunkPayload
+			payloadMap := qdrant.PayloadToMap(point.Payload)
+			data, _ := json.Marshal(payloadMap)
+			var chunk models.CodeChunkPayload
+			if err := json.Unmarshal(data, &chunk); err != nil {
+				continue
+			}
+
+			key := chunk.CodeHash
+			if existing, ok := allResults[key]; ok {
+				existing.FusionScore += float64(point.Score)
+				existing.Rank++
+			} else {
+				allResults[key] = &SearchResult{
+					CodeChunkPayload: chunk,
+					FusionScore:      float64(point.Score),
+					Rank:             1,
+				}
+			}
+		}
 	}
+
+	// Sort by fusion score and apply filter
+	sortedResults := make([]*SearchResult, 0, len(allResults))
+	for _, result := range allResults {
+		if matchesFilter(result.CodeChunkPayload, plan.Filter) {
+			sortedResults = append(sortedResults, result)
+		}
+	}
+
+	// Sort by fusion score descending
+	sort.Slice(sortedResults, func(i, j int) bool {
+		return sortedResults[i].FusionScore > sortedResults[j].FusionScore
+	})
+
+	// Limit to topK
+	if len(sortedResults) > topK {
+		sortedResults = sortedResults[:topK]
+	}
+
+	// Extract final results
+	finalResults := make([]CodeChunkPayload, len(sortedResults))
+	for i, result := range sortedResults {
+		finalResults[i] = result.CodeChunkPayload
+	}
+
+	return map[string]interface{}{
+		"intent":  plan.Intent,
+		"results": finalResults,
+	}, nil
+}
+
+// matchesFilter checks if a code chunk matches the given filter criteria
+func matchesFilter(chunk models.CodeChunkPayload, filter models.QueryFilter) bool {
+	if len(filter.Languages) > 0 {
+		found := false
+		for _, lang := range filter.Languages {
+			if chunk.Language == lang {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	if len(filter.PathPrefix) > 0 {
+		found := false
+		for _, prefix := range filter.PathPrefix {
+			if strings.HasPrefix(chunk.FilePath, prefix) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	if len(filter.NodeTypes) > 0 {
+		found := false
+		for _, nodeType := range filter.NodeTypes {
+			if chunk.NodeType == nodeType {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	lines := chunk.EndLine - chunk.StartLine + 1
+	if filter.MinLines > 0 && lines < filter.MinLines {
+		return false
+	}
+	if filter.MaxLines > 0 && lines > filter.MaxLines {
+		return false
+	}
+
+	return true
 }
 
 func (s *Server) writeResponse(writer *bufio.Writer, id interface{}, result interface{}) {

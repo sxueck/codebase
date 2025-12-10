@@ -112,14 +112,33 @@ func (c *Client) Close() error {
 func (c *Client) EnsureCollection(name string, vectorSize uint64) error {
 	ctx := context.Background()
 
-	_, err := c.collections.Get(ctx, &qdrant.GetCollectionInfoRequest{
+	info, err := c.collections.Get(ctx, &qdrant.GetCollectionInfoRequest{
 		CollectionName: name,
 	})
 
 	if err == nil {
-		return nil
+		// Collection exists, check if vector size matches
+		if params := info.GetResult().GetConfig().GetParams(); params != nil {
+			existingSize := params.GetVectorsConfig().GetParams().GetSize()
+			if existingSize != vectorSize {
+				fmt.Printf("⚠ Collection exists with wrong dimension (expected %d, got %d). Deleting and recreating...\n", vectorSize, existingSize)
+				// Delete the old collection
+				_, err := c.collections.Delete(ctx, &qdrant.DeleteCollection{
+					CollectionName: name,
+				})
+				if err != nil {
+					return fmt.Errorf("failed to delete collection: %w", err)
+				}
+				fmt.Println("✓ Old collection deleted")
+			} else {
+				return nil
+			}
+		} else {
+			return nil
+		}
 	}
 
+	// Create new collection with correct size
 	_, err = c.collections.Create(ctx, &qdrant.CreateCollection{
 		CollectionName: name,
 		VectorsConfig: &qdrant.VectorsConfig{
@@ -134,12 +153,26 @@ func (c *Client) EnsureCollection(name string, vectorSize uint64) error {
 	return err
 }
 
+// DeleteCollection removes the entire collection and all its points from Qdrant.
+func (c *Client) DeleteCollection(name string) error {
+	ctx := context.Background()
+	_, err := c.collections.Delete(ctx, &qdrant.DeleteCollection{
+		CollectionName: name,
+	})
+	return err
+}
+
 func (c *Client) Upsert(collectionName string, points []*qdrant.PointStruct) error {
 	ctx := context.Background()
+
+	// Set wait=true to ensure operation completes before returning
+	wait := true
 	_, err := c.client.Upsert(ctx, &qdrant.UpsertPoints{
 		CollectionName: collectionName,
 		Points:         points,
+		Wait:           &wait,
 	})
+
 	return err
 }
 

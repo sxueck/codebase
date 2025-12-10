@@ -4,6 +4,7 @@ import (
 	"codebase/internal/config"
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/sashabaranov/go-openai"
 )
@@ -15,14 +16,21 @@ type Client struct {
 
 func NewClient() *Client {
 	apiKey := config.Get("OPENAI_API_KEY", "openai_key")
+	if apiKey == "" {
+		fmt.Fprintf(os.Stderr, "⚠ Warning: OPENAI_API_KEY is not set\n")
+	}
+
 	cfg := openai.DefaultConfig(apiKey)
 	if baseURL := config.Get("OPENAI_BASE_URL", "openai_base_url"); baseURL != "" {
 		cfg.BaseURL = baseURL
+		fmt.Fprintf(os.Stderr, "→ Using custom API endpoint: %s\n", baseURL)
 	}
+
 	modelName := config.Get("OPENAI_EMBEDDING_MODEL", "openai_embedding_model")
 	model := openai.SmallEmbedding3
 	if modelName != "" {
 		model = openai.EmbeddingModel(modelName)
+		fmt.Fprintf(os.Stderr, "→ Using embedding model: %s\n", modelName)
 	}
 
 	return &Client{

@@ -6,8 +6,12 @@ import (
 	"codebase/internal/parser"
 	"codebase/internal/qdrant"
 	"codebase/internal/utils"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	qdrantpb "github.com/qdrant/go-client/qdrant"
@@ -15,7 +19,6 @@ import (
 
 const (
 	CollectionName = "codebase_knowledge"
-	VectorSize     = 1536
 	NumWorkers     = 4
 	BatchSize      = 10
 )
@@ -39,32 +42,105 @@ func (idx *Indexer) RegisterParser(lang string, p parser.LanguageParser) {
 }
 
 func (idx *Indexer) IndexProject(rootPath string) error {
-	if err := idx.qdrant.EnsureCollection(CollectionName, VectorSize); err != nil {
-		return err
-	}
-
 	files, err := utils.GetAllSourceFiles(rootPath)
 	if err != nil {
 		return err
 	}
+	fmt.Printf("✓ Found %d source files\n", len(files))
 
-	var wg sync.WaitGroup
-	fileCh := make(chan string, len(files))
-
-	for i := 0; i < NumWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			idx.processWorker(fileCh)
-		}()
+	if len(files) == 0 {
+		fmt.Println("⚠ No source files found to index")
+		return nil
 	}
+
+	// Load previous file hashes for incremental indexing.
+	prevHashes, err := loadFileHashes(rootPath)
+	if err != nil {
+		return fmt.Errorf("failed to load file hashes: %w", err)
+	}
+
+	currentHashes := make(map[string]string, len(files))
+	var changedFiles []string
 
 	for _, f := range files {
-		fileCh <- f
+		hash, herr := hashFile(f)
+		if herr != nil {
+			fmt.Fprintf(os.Stderr, "✗ Failed to hash %s: %v\n", f, herr)
+			continue
+		}
+		// Normalize path to use forward slashes for consistent comparison
+		normalizedPath := filepath.ToSlash(f)
+		currentHashes[normalizedPath] = hash
+		if prev, ok := prevHashes[normalizedPath]; !ok || prev != hash {
+			changedFiles = append(changedFiles, f)
+		}
 	}
-	close(fileCh)
-	wg.Wait()
 
+	var deletedFiles []string
+	for path := range prevHashes {
+		// Convert stored path back to OS-specific format for deletion
+		osPath := filepath.FromSlash(path)
+		if _, ok := currentHashes[path]; !ok {
+			deletedFiles = append(deletedFiles, osPath)
+		}
+	}
+
+	fmt.Printf("→ Incremental index: %d added/modified, %d deleted, %d total files\n", len(changedFiles), len(deletedFiles), len(files))
+
+	if len(changedFiles) == 0 && len(deletedFiles) == 0 {
+		fmt.Println("✓ No changes detected, index is already up to date")
+		return nil
+	}
+
+	// Detect vector size by creating a sample embedding
+	fmt.Println("→ Detecting vector dimensions...")
+	sampleVec, err := idx.embeddings.Embed("sample text for dimension detection")
+	if err != nil {
+		return fmt.Errorf("failed to detect vector dimensions: %w", err)
+	}
+	vectorSize := uint64(len(sampleVec))
+	fmt.Printf("✓ Detected vector dimension: %d\n", vectorSize)
+
+	// Ensure collection with detected vector size
+	if err := idx.qdrant.EnsureCollection(CollectionName, vectorSize); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Collection '%s' ensured with dimension %d\n", CollectionName, vectorSize)
+
+	// Delete vectors for files that have been removed from the filesystem.
+	for _, path := range deletedFiles {
+		if err := idx.deleteFilePoints(path); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ Error deleting vectors for removed file %s: %v\n", path, err)
+		} else {
+			fmt.Printf("✓ Deleted vectors for removed file %s\n", path)
+		}
+	}
+
+	// Index only added or modified files.
+	if len(changedFiles) > 0 {
+		var wg sync.WaitGroup
+		fileCh := make(chan string, len(changedFiles))
+
+		for i := 0; i < NumWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				idx.processWorker(fileCh)
+			}()
+		}
+
+		for _, f := range changedFiles {
+			fileCh <- f
+		}
+		close(fileCh)
+		wg.Wait()
+	}
+
+	if err := saveFileHashes(rootPath, currentHashes); err != nil {
+		return fmt.Errorf("failed to save file hashes: %w", err)
+	}
+
+	fmt.Println("✓ Indexing completed")
 	return nil
 }
 
@@ -77,6 +153,15 @@ func (idx *Indexer) processWorker(fileCh <-chan string) {
 }
 
 func (idx *Indexer) processFile(path string) error {
+	// Normalize path for consistent storage in Qdrant
+	normalizedPath := filepath.ToSlash(path)
+	
+	// For modified files, clear any existing vectors for this file before
+	// re-indexing so that removed functions do not leave stale points.
+	if err := idx.deleteFilePoints(normalizedPath); err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Error deleting existing vectors for %s: %v\n", path, err)
+	}
+
 	lang := utils.DetectLanguage(path)
 	if lang == "" {
 		return nil
@@ -94,6 +179,7 @@ func (idx *Indexer) processFile(path string) error {
 
 	funcs, err := p.ExtractFunctions(path, code)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Error parsing %s: %v\n", path, err)
 		return err
 	}
 
@@ -101,21 +187,32 @@ func (idx *Indexer) processFile(path string) error {
 		return nil
 	}
 
-	contents := make([]string, 0, len(funcs))
-	for _, fn := range funcs {
-		contents = append(contents, fn.Content)
-	}
+	fmt.Printf("→ Processing %s (%d functions)\n", path, len(funcs))
+
+    // Build embedding texts that include both code and lightweight metadata so
+    // that natural-language queries mentioning file paths or symbol names
+    // (e.g. "utils helper functions") can be matched more reliably.
+    contents := make([]string, 0, len(funcs))
+    for _, fn := range funcs {
+        text := fmt.Sprintf(
+            "file_path: %s\nlanguage: %s\nnode_name: %s\nnode_type: %s\n\n%s",
+            normalizedPath, lang, fn.Name, fn.NodeType, fn.Content,
+        )
+        contents = append(contents, text)
+    }
 
 	vectors, err := idx.embeddings.EmbedBatch(contents)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Error embedding %s: %v\n", path, err)
 		return err
 	}
 
 	points := make([]*qdrantpb.PointStruct, 0, len(funcs))
 	for i, fn := range funcs {
 		hash := utils.HashContent(fn.Content)
+		id := contentHashToPointID(hash)
 		payload := models.CodeChunkPayload{
-			FilePath:  path,
+			FilePath:  normalizedPath,
 			Language:  lang,
 			NodeType:  fn.NodeType,
 			NodeName:  fn.Name,
@@ -138,8 +235,8 @@ func (idx *Indexer) processFile(path string) error {
 
 		points = append(points, &qdrantpb.PointStruct{
 			Id: &qdrantpb.PointId{
-				PointIdOptions: &qdrantpb.PointId_Uuid{
-					Uuid: hash,
+				PointIdOptions: &qdrantpb.PointId_Num{
+					Num: id,
 				},
 			},
 			Vectors: &qdrantpb.Vectors{
@@ -153,5 +250,88 @@ func (idx *Indexer) processFile(path string) error {
 		})
 	}
 
-	return idx.qdrant.Upsert(CollectionName, points)
+	err = idx.qdrant.Upsert(CollectionName, points)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Error upserting %s: %v\n", path, err)
+		return err
+	}
+
+	fmt.Printf("✓ Indexed %s (%d vectors)\n", path, len(points))
+	return nil
+}
+
+// contentHashToPointID converts a hex-encoded SHA-256 hash string into a 64-bit
+// numeric ID that is accepted by Qdrant's `PointId_Num` field. We take the
+// first 8 bytes of the hash and interpret them as a big-endian uint64.
+func contentHashToPointID(hash string) uint64 {
+	// utils.HashContent already uses SHA-256, but we defensively recompute in
+	// case the implementation changes while keeping behaviour stable here.
+	h := sha256.Sum256([]byte(hash))
+	return binary.BigEndian.Uint64(h[:8])
+}
+
+// hashFile computes a stable hash for a file's entire contents. It is used to
+// detect added/modified files for incremental indexing.
+func hashFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return utils.HashContent(string(data)), nil
+}
+
+// loadFileHashes loads the last-seen file hash map from disk. It is stored as
+// a simple JSON map at <rootPath>/file_hashes.json.
+func loadFileHashes(rootPath string) (map[string]string, error) {
+	statePath := filepath.Join(rootPath, "file_hashes.json")
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return make(map[string]string), nil
+		}
+		return nil, err
+	}
+
+	var hashes map[string]string
+	if err := json.Unmarshal(data, &hashes); err != nil {
+		return nil, err
+	}
+	if hashes == nil {
+		hashes = make(map[string]string)
+	}
+	return hashes, nil
+}
+
+// saveFileHashes persists the current file hash map so that the next indexing
+// run can cheaply detect which files have changed.
+func saveFileHashes(rootPath string, hashes map[string]string) error {
+	statePath := filepath.Join(rootPath, "file_hashes.json")
+	data, err := json.MarshalIndent(hashes, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(statePath, data, 0o644)
+}
+
+// deleteFilePoints removes all vectors in Qdrant whose payload file_path
+// matches the given path.
+func (idx *Indexer) deleteFilePoints(path string) error {
+	filter := &qdrantpb.Filter{
+		Must: []*qdrantpb.Condition{
+			{
+				ConditionOneOf: &qdrantpb.Condition_Field{
+					Field: &qdrantpb.FieldCondition{
+						Key: "file_path",
+						Match: &qdrantpb.Match{
+							MatchValue: &qdrantpb.Match_Keyword{
+								Keyword: path,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	return idx.qdrant.DeleteByFilter(CollectionName, filter)
 }
