@@ -92,14 +92,39 @@ function Install-CodebaseBinary {
     Invoke-WebRequest -Uri $Asset.browser_download_url -Headers $headers -OutFile $downloadPath
 
     $ext = [IO.Path]::GetExtension($downloadPath)
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($Asset.name)
 
     if ($ext -eq ".zip") {
         Write-Info "检测到 ZIP 归档，正在解压到安装目录。"
         Expand-Archive -LiteralPath $downloadPath -DestinationPath $InstallDir -Force
+
+        # 在解压出的内容中查找可执行文件，并规范为 codebase.exe
+        $exeCandidates = Get-ChildItem -Path $InstallDir -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue
+        if ($exeCandidates) {
+            $expectedName = "$baseName.exe"
+            $selected = $exeCandidates | Where-Object { $_.Name -ieq $expectedName } | Select-Object -First 1
+            if (-not $selected) {
+                $selected = $exeCandidates | Select-Object -First 1
+            }
+
+            $finalExePath = Join-Path $InstallDir "codebase.exe"
+            Write-Info "将 $($selected.FullName) 规范化命名为 $finalExePath"
+            Copy-Item -Path $selected.FullName -Destination $finalExePath -Force
+        } else {
+            Write-Warn "未在安装目录中找到 .exe 文件，请检查 release 资产内容。"
+        }
     } else {
-        Write-Info "直接复制构建文件到安装目录。"
-        $targetPath = Join-Path $InstallDir $Asset.name
-        Copy-Item -Path $downloadPath -Destination $targetPath -Force
+        if ($ext -eq ".exe") {
+            # 直接下载到的就是 Windows 可执行文件，规范为 codebase.exe
+            $finalExePath = Join-Path $InstallDir "codebase.exe"
+            Write-Info "将下载的可执行文件重命名为 $finalExePath"
+            Copy-Item -Path $downloadPath -Destination $finalExePath -Force
+        } else {
+            # 其他未知类型，保留原始文件名
+            Write-Info "检测到扩展名 $ext，使用原始文件名安装。"
+            $targetPath = Join-Path $InstallDir $Asset.name
+            Copy-Item -Path $downloadPath -Destination $targetPath -Force
+        }
     }
 
     Remove-Item -Path $downloadPath -ErrorAction SilentlyContinue
