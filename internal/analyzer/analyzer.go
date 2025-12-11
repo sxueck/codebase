@@ -12,14 +12,16 @@ import (
 )
 
 type Analyzer struct {
-	qdrant *qdrant.Client
-	llm    *llm.Client
+	qdrant     *qdrant.Client
+	llm        *llm.Client
+	collection string
 }
 
-func NewAnalyzer(qc *qdrant.Client, lc *llm.Client) *Analyzer {
+func NewAnalyzer(qc *qdrant.Client, lc *llm.Client, collection string) *Analyzer {
 	return &Analyzer{
-		qdrant: qc,
-		llm:    lc,
+		qdrant:     qc,
+		llm:        lc,
+		collection: collection,
 	}
 }
 
@@ -55,9 +57,13 @@ func (a *Analyzer) fetchAllVectors(filter models.QueryFilter) ([]models.CodeChun
 
 	var offset *qdrantpb.PointId
 	limit := uint32(100)
+	collection := a.collection
+	if collection == "" {
+		collection = indexer.CollectionName("")
+	}
 
 	for {
-		points, nextOffset, err := a.qdrant.Scroll(indexer.CollectionName, limit, offset)
+		points, nextOffset, err := a.qdrant.Scroll(collection, limit, offset)
 		if err != nil {
 			return nil, nil, err
 		}

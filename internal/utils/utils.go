@@ -21,12 +21,12 @@ var excludedDirs = map[string]bool{
 }
 
 var languageExts = map[string]string{
-	".go":   "go",
-	".py":   "python",
-	".ts":   "typescript",
-	".tsx":  "typescript",
-	".js":   "javascript",
-	".jsx":  "javascript",
+	".go":  "go",
+	".py":  "python",
+	".ts":  "typescript",
+	".tsx": "typescript",
+	".js":  "javascript",
+	".jsx": "javascript",
 }
 
 func GetAllSourceFiles(rootPath string) ([]string, error) {
@@ -167,4 +167,42 @@ func isIgnoredPath(relPath string, patterns []string) bool {
 	}
 
 	return false
+}
+
+// NormalizeProjectRoot resolves the provided path to an absolute, cleaned
+// directory so project-level identifiers remain stable regardless of how the
+// CLI is invoked.
+func NormalizeProjectRoot(rootPath string) (string, error) {
+	if rootPath == "" {
+		rootPath = "."
+	}
+	absPath, err := filepath.Abs(rootPath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(absPath), nil
+}
+
+// ComputeProjectID returns a stable hash for the given project root path.
+// The hash is used to derive per-project Qdrant collection names and index
+// state files.
+func ComputeProjectID(rootPath string) (string, error) {
+	normalized, err := NormalizeProjectRoot(rootPath)
+	if err != nil {
+		return "", err
+	}
+	return HashContent(normalized), nil
+}
+
+// UserStateDir ensures the ~/.codebase directory exists and returns its path.
+func UserStateDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	stateDir := filepath.Join(home, ".codebase")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return "", err
+	}
+	return stateDir, nil
 }

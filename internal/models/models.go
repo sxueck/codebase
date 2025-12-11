@@ -1,22 +1,34 @@
 package models
 
 type CodeChunkPayload struct {
-	FilePath  string  `json:"file_path"`
-	Language  string  `json:"language"`
-	NodeType  string  `json:"node_type"`
-	NodeName  string  `json:"node_name"`
-	StartLine int     `json:"start_line"`
-	EndLine   int     `json:"end_line"`
-	CodeHash  string  `json:"code_hash"`
-	Content   string  `json:"content"`
+	FilePath    string   `json:"file_path"`
+	Language    string   `json:"language"`
+	NodeType    string   `json:"node_type"`
+	NodeName    string   `json:"node_name"`
+	StartLine   int      `json:"start_line"`
+	EndLine     int      `json:"end_line"`
+	CodeHash    string   `json:"code_hash"`
+	Content     string   `json:"content"`
+	PackageName string   `json:"package_name"`
+	Imports     []string `json:"imports"`
+	Signature   string   `json:"signature"`
+	Receiver    string   `json:"receiver"`
+	Doc         string   `json:"doc"`
+	Callees     []string `json:"callees"`
 }
 
 type FunctionNode struct {
-	Name      string
-	NodeType  string
-	StartLine int
-	EndLine   int
-	Content   string
+	Name        string
+	NodeType    string
+	StartLine   int
+	EndLine     int
+	Content     string
+	PackageName string
+	Imports     []string
+	Signature   string
+	Receiver    string
+	Doc         string
+	Callees     []string
 }
 
 type IntentType string
@@ -37,16 +49,16 @@ type QueryFilter struct {
 }
 
 type QueryPlan struct {
-	Intent     IntentType   `json:"intent"`
-	SubQueries []string     `json:"sub_queries"`
-	Filter     QueryFilter  `json:"filter"`
-	Threshold  float64      `json:"threshold"`
+	Intent     IntentType  `json:"intent"`
+	SubQueries []string    `json:"sub_queries"`
+	Filter     QueryFilter `json:"filter"`
+	Threshold  float64     `json:"threshold"`
 }
 
 type DuplicateGroup struct {
-	Chunks      []CodeChunkPayload `json:"chunks"`
-	AvgScore    float64            `json:"avg_score"`
-	Reason      string             `json:"reason"`
+	Chunks   []CodeChunkPayload `json:"chunks"`
+	AvgScore float64            `json:"avg_score"`
+	Reason   string             `json:"reason"`
 }
 
 type PairCandidate struct {

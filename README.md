@@ -10,6 +10,10 @@ A powerful CLI tool for semantic code search and duplicate detection using vecto
 - **MCP Integration**: Model Context Protocol server for LLM integration
 - **Vector Database**: Uses Qdrant for efficient similarity search
 
+## Hybrid Retrieval Progress
+
+- **Go AST Metadata**: `internal/parser/go_parser.go` now captures package names, imports, signatures, doc comments, and callees for every function/method. The indexer (`internal/indexer/indexer.go`) injects this metadata into both embeddings and Qdrant payloads so hybrid queries can combine semantic similarity with structured filters.
+
 ## Roadmap: AST-Aware Semantic Search
 
 This project already uses Go's built-in AST packages to extract function and method definitions for indexing. We plan to extend this further to get closer to tools like `claude-context` that use AST-based splitting for richer semantic understanding.

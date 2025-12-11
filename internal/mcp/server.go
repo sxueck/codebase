@@ -9,6 +9,7 @@ import (
 	"codebase/internal/llm"
 	"codebase/internal/models"
 	"codebase/internal/qdrant"
+	"codebase/internal/utils"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -55,9 +56,17 @@ type Server struct {
 	embedClient  *embeddings.Client
 	llmClient    *llm.Client
 	analyzer     *analyzer.Analyzer
+	collection   string
 }
 
-func NewServer() (*Server, error) {
+func (s *Server) collectionName() string {
+	if strings.TrimSpace(s.collection) == "" {
+		return indexer.CollectionName("")
+	}
+	return s.collection
+}
+
+func NewServer(rootDir string) (*Server, error) {
 	// Best-effort load of shared config from ~/.codebase/config.json.
 	// Values from this file are applied as environment variables (if not
 	// already set) so that downstream clients can use the standard config
@@ -71,15 +80,22 @@ func NewServer() (*Server, error) {
 		return nil, err
 	}
 
+	projectID, err := utils.ComputeProjectID(rootDir)
+	if err != nil {
+		return nil, err
+	}
+	collection := indexer.CollectionName(projectID)
+
 	ec := embeddings.NewClient()
 	lc := llm.NewClient()
-	az := analyzer.NewAnalyzer(qc, lc)
+	az := analyzer.NewAnalyzer(qc, lc, collection)
 
 	return &Server{
 		qdrantClient: qc,
 		embedClient:  ec,
 		llmClient:    lc,
 		analyzer:     az,
+		collection:   collection,
 	}, nil
 }
 
@@ -175,14 +191,14 @@ func (s *Server) handlePing(writer *bufio.Writer, req *JSONRPCRequest) {
 func (s *Server) handleToolsList(writer *bufio.Writer, req *JSONRPCRequest) {
 	tools := []map[string]interface{}{
 		{
-			"name":        "codebase-retrieval",
-			"description": "Semantic code search over this repository's indexed codebase. Use this whenever you need to read or understand existing code before answering a question or proposing changes. Given a natural language query, it returns the most relevant code snippets and their file paths so you can ground your reasoning in the real project instead of guessing.",
+			"name": "codebase-retrieval",
+			"description": "Primary MCP for this repo. Before attempting ANY code retrieval, requirement analysis, or contextual grounding for a user request, you must call this tool once. It performs semantic code search over the indexed repository so answers stay anchored to real code instead of assumptions.",
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"query": map[string]interface{}{
-						"type":        "string",
-						"description": "Natural language description of what you want to find in this codebase. Prefer rich, specific queries that mention languages, frameworks, symbols, file paths, or behaviors (for example: 'Go handler that serves the search API', 'where we call the Qdrant client for semantic search', or 'all code that parses TypeScript files'). Use this tool whenever the user asks about existing behavior, architecture, or how something is implemented.",
+						"type": "string",
+						"description": "Natural language description of what you need to inspect in this repo. Always populate this and call the tool first whenever (a) a user asks for code search, diffing, or refactors, or (b) you need to understand user requirements by locating related context in the codebase. Include specific symbols/files/features to maximize recall.",
 					},
 					"top_k": map[string]interface{}{
 						"type":        "integer",
@@ -276,7 +292,7 @@ func (s *Server) simpleSearch(query string, topK int) (interface{}, error) {
 		return nil, err
 	}
 
-	results, err := s.qdrantClient.Search(indexer.CollectionName, vec, uint64(topK))
+	results, err := s.qdrantClient.Search(s.collectionName(), vec, uint64(topK))
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +328,7 @@ func (s *Server) handleSemanticIntent(plan *QueryPlan, topK int) (interface{}, e
 			continue // Skip failed embeddings
 		}
 
-		scoredPoints, err := s.qdrantClient.Search(indexer.CollectionName, vec, uint64(topK*2))
+		scoredPoints, err := s.qdrantClient.Search(s.collectionName(), vec, uint64(topK*2))
 		if err != nil {
 			continue // Skip failed searches
 		}

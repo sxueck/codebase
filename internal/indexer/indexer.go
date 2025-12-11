@@ -12,21 +12,35 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	qdrantpb "github.com/qdrant/go-client/qdrant"
 )
 
 const (
-	CollectionName = "codebase_knowledge"
-	NumWorkers     = 4
-	BatchSize      = 10
+	defaultCollectionName = "codebase_default"
+	collectionPrefix      = "codebase_"
+	NumWorkers            = 4
+	BatchSize             = 10
 )
+
+// CollectionName returns the Qdrant collection name for a given project ID.
+// If projectID is empty, the shared default collection is used.
+func CollectionName(projectID string) string {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return defaultCollectionName
+	}
+	return fmt.Sprintf("%s%s", collectionPrefix, projectID)
+}
 
 type Indexer struct {
 	qdrant     *qdrant.Client
 	embeddings *embeddings.Client
 	parsers    map[string]parser.LanguageParser
+	projectID  string
+	collection string
 }
 
 func NewIndexer(qc *qdrant.Client, ec *embeddings.Client) *Indexer {
@@ -42,6 +56,19 @@ func (idx *Indexer) RegisterParser(lang string, p parser.LanguageParser) {
 }
 
 func (idx *Indexer) IndexProject(rootPath string) error {
+	projectID, err := utils.ComputeProjectID(rootPath)
+	if err != nil {
+		return fmt.Errorf("failed to compute project id: %w", err)
+	}
+	idx.projectID = projectID
+	idx.collection = CollectionName(projectID)
+	shortID := projectID
+	if len(shortID) > 12 {
+		shortID = projectID[:12]
+	}
+	fmt.Printf("→ Project fingerprint: %s\n", shortID)
+	fmt.Printf("→ Using collection: %s\n", idx.collection)
+
 	files, err := utils.GetAllSourceFiles(rootPath)
 	if err != nil {
 		return err
@@ -54,7 +81,7 @@ func (idx *Indexer) IndexProject(rootPath string) error {
 	}
 
 	// Load previous file hashes for incremental indexing.
-	prevHashes, err := loadFileHashes(rootPath)
+	prevHashes, err := loadFileHashes(projectID)
 	if err != nil {
 		return fmt.Errorf("failed to load file hashes: %w", err)
 	}
@@ -78,10 +105,8 @@ func (idx *Indexer) IndexProject(rootPath string) error {
 
 	var deletedFiles []string
 	for path := range prevHashes {
-		// Convert stored path back to OS-specific format for deletion
-		osPath := filepath.FromSlash(path)
 		if _, ok := currentHashes[path]; !ok {
-			deletedFiles = append(deletedFiles, osPath)
+			deletedFiles = append(deletedFiles, path)
 		}
 	}
 
@@ -102,17 +127,18 @@ func (idx *Indexer) IndexProject(rootPath string) error {
 	fmt.Printf("✓ Detected vector dimension: %d\n", vectorSize)
 
 	// Ensure collection with detected vector size
-	if err := idx.qdrant.EnsureCollection(CollectionName, vectorSize); err != nil {
+	if err := idx.qdrant.EnsureCollection(idx.collection, vectorSize); err != nil {
 		return err
 	}
-	fmt.Printf("✓ Collection '%s' ensured with dimension %d\n", CollectionName, vectorSize)
+	fmt.Printf("✓ Collection '%s' ensured with dimension %d\n", idx.collection, vectorSize)
 
 	// Delete vectors for files that have been removed from the filesystem.
-	for _, path := range deletedFiles {
-		if err := idx.deleteFilePoints(path); err != nil {
-			fmt.Fprintf(os.Stderr, "✗ Error deleting vectors for removed file %s: %v\n", path, err)
+	for _, normalizedPath := range deletedFiles {
+		displayPath := filepath.FromSlash(normalizedPath)
+		if err := idx.deleteFilePoints(normalizedPath); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ Error deleting vectors for removed file %s: %v\n", displayPath, err)
 		} else {
-			fmt.Printf("✓ Deleted vectors for removed file %s\n", path)
+			fmt.Printf("✓ Deleted vectors for removed file %s\n", displayPath)
 		}
 	}
 
@@ -136,7 +162,7 @@ func (idx *Indexer) IndexProject(rootPath string) error {
 		wg.Wait()
 	}
 
-	if err := saveFileHashes(rootPath, currentHashes); err != nil {
+	if err := saveFileHashes(idx.projectID, currentHashes); err != nil {
 		return fmt.Errorf("failed to save file hashes: %w", err)
 	}
 
@@ -153,9 +179,12 @@ func (idx *Indexer) processWorker(fileCh <-chan string) {
 }
 
 func (idx *Indexer) processFile(path string) error {
+	if idx.collection == "" {
+		return fmt.Errorf("collection name is not set on indexer")
+	}
 	// Normalize path for consistent storage in Qdrant
 	normalizedPath := filepath.ToSlash(path)
-	
+
 	// For modified files, clear any existing vectors for this file before
 	// re-indexing so that removed functions do not leave stale points.
 	if err := idx.deleteFilePoints(normalizedPath); err != nil {
@@ -189,17 +218,38 @@ func (idx *Indexer) processFile(path string) error {
 
 	fmt.Printf("→ Processing %s (%d functions)\n", path, len(funcs))
 
-    // Build embedding texts that include both code and lightweight metadata so
-    // that natural-language queries mentioning file paths or symbol names
-    // (e.g. "utils helper functions") can be matched more reliably.
-    contents := make([]string, 0, len(funcs))
-    for _, fn := range funcs {
-        text := fmt.Sprintf(
-            "file_path: %s\nlanguage: %s\nnode_name: %s\nnode_type: %s\n\n%s",
-            normalizedPath, lang, fn.Name, fn.NodeType, fn.Content,
-        )
-        contents = append(contents, text)
-    }
+	// Build embedding texts that combine code with richer AST metadata for
+	// hybrid retrieval (symbol, import, and signature level signals).
+	contents := make([]string, 0, len(funcs))
+	for _, fn := range funcs {
+		metaLines := []string{
+			fmt.Sprintf("file_path: %s", normalizedPath),
+			fmt.Sprintf("language: %s", lang),
+			fmt.Sprintf("node_name: %s", fn.Name),
+			fmt.Sprintf("node_type: %s", fn.NodeType),
+		}
+		if fn.PackageName != "" {
+			metaLines = append(metaLines, fmt.Sprintf("package: %s", fn.PackageName))
+		}
+		if len(fn.Imports) > 0 {
+			metaLines = append(metaLines, fmt.Sprintf("imports: %s", strings.Join(fn.Imports, ", ")))
+		}
+		if fn.Signature != "" {
+			metaLines = append(metaLines, fmt.Sprintf("signature: %s", fn.Signature))
+		}
+		if fn.Receiver != "" {
+			metaLines = append(metaLines, fmt.Sprintf("receiver: %s", fn.Receiver))
+		}
+		if fn.Doc != "" {
+			metaLines = append(metaLines, fmt.Sprintf("doc: %s", fn.Doc))
+		}
+		if len(fn.Callees) > 0 {
+			metaLines = append(metaLines, fmt.Sprintf("callees: %s", strings.Join(fn.Callees, ", ")))
+		}
+
+		text := fmt.Sprintf("%s\n\n%s", strings.Join(metaLines, "\n"), fn.Content)
+		contents = append(contents, text)
+	}
 
 	vectors, err := idx.embeddings.EmbedBatch(contents)
 	if err != nil {
@@ -212,25 +262,37 @@ func (idx *Indexer) processFile(path string) error {
 		hash := utils.HashContent(fn.Content)
 		id := contentHashToPointID(hash)
 		payload := models.CodeChunkPayload{
-			FilePath:  normalizedPath,
-			Language:  lang,
-			NodeType:  fn.NodeType,
-			NodeName:  fn.Name,
-			StartLine: fn.StartLine,
-			EndLine:   fn.EndLine,
-			CodeHash:  hash,
-			Content:   fn.Content,
+			FilePath:    normalizedPath,
+			Language:    lang,
+			NodeType:    fn.NodeType,
+			NodeName:    fn.Name,
+			StartLine:   fn.StartLine,
+			EndLine:     fn.EndLine,
+			CodeHash:    hash,
+			Content:     fn.Content,
+			PackageName: fn.PackageName,
+			Imports:     fn.Imports,
+			Signature:   fn.Signature,
+			Receiver:    fn.Receiver,
+			Doc:         fn.Doc,
+			Callees:     fn.Callees,
 		}
 
 		payloadMap := map[string]interface{}{
-			"file_path":  payload.FilePath,
-			"language":   payload.Language,
-			"node_type":  payload.NodeType,
-			"node_name":  payload.NodeName,
-			"start_line": payload.StartLine,
-			"end_line":   payload.EndLine,
-			"code_hash":  payload.CodeHash,
-			"content":    payload.Content,
+			"file_path":    payload.FilePath,
+			"language":     payload.Language,
+			"node_type":    payload.NodeType,
+			"node_name":    payload.NodeName,
+			"start_line":   payload.StartLine,
+			"end_line":     payload.EndLine,
+			"code_hash":    payload.CodeHash,
+			"content":      payload.Content,
+			"package_name": payload.PackageName,
+			"imports":      payload.Imports,
+			"signature":    payload.Signature,
+			"receiver":     payload.Receiver,
+			"doc":          payload.Doc,
+			"callees":      payload.Callees,
 		}
 
 		points = append(points, &qdrantpb.PointStruct{
@@ -250,7 +312,7 @@ func (idx *Indexer) processFile(path string) error {
 		})
 	}
 
-	err = idx.qdrant.Upsert(CollectionName, points)
+	err = idx.qdrant.Upsert(idx.collection, points)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "✗ Error upserting %s: %v\n", path, err)
 		return err
@@ -281,9 +343,12 @@ func hashFile(path string) (string, error) {
 }
 
 // loadFileHashes loads the last-seen file hash map from disk. It is stored as
-// a simple JSON map at <rootPath>/file_hashes.json.
-func loadFileHashes(rootPath string) (map[string]string, error) {
-	statePath := filepath.Join(rootPath, "file_hashes.json")
+// a JSON file under ~/.codebase scoped by the project ID.
+func loadFileHashes(projectID string) (map[string]string, error) {
+	statePath, err := fileHashStatePath(projectID)
+	if err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(statePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -304,8 +369,11 @@ func loadFileHashes(rootPath string) (map[string]string, error) {
 
 // saveFileHashes persists the current file hash map so that the next indexing
 // run can cheaply detect which files have changed.
-func saveFileHashes(rootPath string, hashes map[string]string) error {
-	statePath := filepath.Join(rootPath, "file_hashes.json")
+func saveFileHashes(projectID string, hashes map[string]string) error {
+	statePath, err := fileHashStatePath(projectID)
+	if err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(hashes, "", "  ")
 	if err != nil {
 		return err
@@ -313,9 +381,24 @@ func saveFileHashes(rootPath string, hashes map[string]string) error {
 	return os.WriteFile(statePath, data, 0o644)
 }
 
+func fileHashStatePath(projectID string) (string, error) {
+	stateDir, err := utils.UserStateDir()
+	if err != nil {
+		return "", err
+	}
+	if projectID == "" {
+		projectID = "default"
+	}
+	fileName := fmt.Sprintf("%s_file_hashes.json", projectID)
+	return filepath.Join(stateDir, fileName), nil
+}
+
 // deleteFilePoints removes all vectors in Qdrant whose payload file_path
 // matches the given path.
 func (idx *Indexer) deleteFilePoints(path string) error {
+	if idx.collection == "" {
+		return fmt.Errorf("collection name is not set on indexer")
+	}
 	filter := &qdrantpb.Filter{
 		Must: []*qdrantpb.Condition{
 			{
@@ -333,5 +416,5 @@ func (idx *Indexer) deleteFilePoints(path string) error {
 		},
 	}
 
-	return idx.qdrant.DeleteByFilter(CollectionName, filter)
+	return idx.qdrant.DeleteByFilter(idx.collection, filter)
 }

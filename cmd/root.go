@@ -7,6 +7,7 @@ import (
 	"codebase/internal/mcp"
 	"codebase/internal/parser"
 	"codebase/internal/qdrant"
+	"codebase/internal/utils"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -20,44 +21,45 @@ var rootCmd = &cobra.Command{
 	Long:  "A CLI tool for indexing, searching, and analyzing codebases using vector embeddings and LLM",
 }
 
-	var indexCmd = &cobra.Command{
-		Use:   "index",
-		Short: "Index codebase to vector database",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// Load shared config (~/.codebase/config.json) so OPENAI_*/QDRANT_*
-			// from that file are visible as env vars when running via CLI.
-			if err := config.LoadFromUserConfig(); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-			}
+var indexCmd = &cobra.Command{
+	Use:   "index",
+	Short: "Index codebase to vector database",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		// Load shared config (~/.codebase/config.json) so OPENAI_*/QDRANT_*
+		// from that file are visible as env vars when running via CLI.
+		if err := config.LoadFromUserConfig(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		}
 
-			dir, _ := cmd.Flags().GetString("dir")
+		dir, _ := cmd.Flags().GetString("dir")
 
-			qc, err := qdrant.NewClient()
-			if err != nil {
-				return err
-			}
-			defer qc.Close()
+		qc, err := qdrant.NewClient()
+		if err != nil {
+			return err
+		}
+		defer qc.Close()
 
-			ec := embeddings.NewClient()
-			idx := indexer.NewIndexer(qc, ec)
+		ec := embeddings.NewClient()
+		idx := indexer.NewIndexer(qc, ec)
 
-			// Register language parsers so that source files can actually be
-			// parsed into function-level chunks before indexing.
-			idx.RegisterParser(string(parser.LanguageGo), parser.NewGoParser())
-			idx.RegisterParser(string(parser.LanguagePython), parser.NewPythonParser())
-			idx.RegisterParser(string(parser.LanguageJavaScript), parser.NewJavaScriptParser())
-			idx.RegisterParser(string(parser.LanguageTypeScript), parser.NewTypeScriptParser())
+		// Register language parsers so that source files can actually be
+		// parsed into function-level chunks before indexing.
+		idx.RegisterParser(string(parser.LanguageGo), parser.NewGoParser())
+		idx.RegisterParser(string(parser.LanguagePython), parser.NewPythonParser())
+		idx.RegisterParser(string(parser.LanguageJavaScript), parser.NewJavaScriptParser())
+		idx.RegisterParser(string(parser.LanguageTypeScript), parser.NewTypeScriptParser())
 
-			fmt.Printf("Indexing project at: %s\n", dir)
-			return idx.IndexProject(dir)
-		},
-	}
+		fmt.Printf("Indexing project at: %s\n", dir)
+		return idx.IndexProject(dir)
+	},
+}
 
 var mcpCmd = &cobra.Command{
 	Use:   "mcp",
 	Short: "Start MCP server over stdio",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		server, err := mcp.NewServer()
+		dir, _ := cmd.Flags().GetString("dir")
+		server, err := mcp.NewServer(dir)
 		if err != nil {
 			return err
 		}
@@ -77,9 +79,16 @@ var queryCmd = &cobra.Command{
 
 		q, _ := cmd.Flags().GetString("q")
 		topK, _ := cmd.Flags().GetInt("top_k")
+		dir, _ := cmd.Flags().GetString("dir")
 		if topK <= 0 {
 			topK = 10
 		}
+
+		projectID, err := utils.ComputeProjectID(dir)
+		if err != nil {
+			return fmt.Errorf("failed to compute project id: %w", err)
+		}
+		collection := indexer.CollectionName(projectID)
 
 		qc, err := qdrant.NewClient()
 		if err != nil {
@@ -93,7 +102,7 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
-		results, err := qc.Search(indexer.CollectionName, vec, uint64(topK))
+		results, err := qc.Search(collection, vec, uint64(topK))
 		if err != nil {
 			return err
 		}
@@ -115,14 +124,21 @@ var clearIndexCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		}
 
+		dir, _ := cmd.Flags().GetString("dir")
+		projectID, err := utils.ComputeProjectID(dir)
+		if err != nil {
+			return fmt.Errorf("failed to compute project id: %w", err)
+		}
+		collection := indexer.CollectionName(projectID)
+
 		qc, err := qdrant.NewClient()
 		if err != nil {
 			return err
 		}
 		defer qc.Close()
 
-		fmt.Printf("Deleting collection: %s\n", indexer.CollectionName)
-		if err := qc.DeleteCollection(indexer.CollectionName); err != nil {
+		fmt.Printf("Deleting collection: %s\n", collection)
+		if err := qc.DeleteCollection(collection); err != nil {
 			return err
 		}
 		fmt.Println("✓ Collection deleted")
@@ -134,6 +150,9 @@ func init() {
 	indexCmd.Flags().String("dir", ".", "Project root directory")
 	queryCmd.Flags().String("q", "", "Natural language query")
 	queryCmd.Flags().Int("top_k", 10, "Maximum number of results to return")
+	queryCmd.Flags().String("dir", ".", "Project root directory (must match the directory passed to 'codebase index')")
+	mcpCmd.Flags().String("dir", ".", "Project root directory (server scopes searches to this directory)")
+	clearIndexCmd.Flags().String("dir", ".", "Project root directory to clear from Qdrant")
 
 	rootCmd.AddCommand(indexCmd)
 	rootCmd.AddCommand(mcpCmd)

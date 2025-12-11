@@ -32,9 +32,8 @@ func LoadFromUserConfig() error {
 		if value == "" {
 			continue
 		}
-		if os.Getenv(key) == "" {
-			_ = os.Setenv(key, value)
-		}
+		// Values from ~/.codebase/config.json take precedence over existing env vars.
+		_ = os.Setenv(key, value)
 	}
 
 	return nil
