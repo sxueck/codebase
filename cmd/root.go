@@ -7,12 +7,20 @@ import (
 	"codebase/internal/mcp"
 	"codebase/internal/parser"
 	"codebase/internal/qdrant"
+	"codebase/internal/updater"
 	"codebase/internal/utils"
 	"encoding/json"
 	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
+)
+
+// These variables are set during build using ldflags
+var (
+	Version   = "dev"
+	GitCommit = "unknown"
+	BuildTime = "unknown"
 )
 
 var rootCmd = &cobra.Command{
@@ -144,6 +152,60 @@ var clearIndexCmd = &cobra.Command{
 	},
 }
 
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print version information",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("codebase version %s\n", Version)
+		fmt.Printf("Git commit: %s\n", GitCommit)
+		fmt.Printf("Build time: %s\n", BuildTime)
+	},
+}
+
+var updateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "Update codebase to the latest version",
+	Long:  "Check for and install the latest version of codebase from GitHub releases",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		force, _ := cmd.Flags().GetBool("force")
+		checkOnly, _ := cmd.Flags().GetBool("check")
+
+		u := updater.NewUpdater(Version)
+
+		fmt.Println("Checking for updates...")
+		release, hasUpdate, err := u.CheckForUpdate()
+		if err != nil {
+			return fmt.Errorf("failed to check for updates: %w", err)
+		}
+
+		if !hasUpdate && !force {
+			fmt.Println("You are already running the latest version.")
+			return nil
+		}
+
+		fmt.Printf("Current version: %s\n", Version)
+		fmt.Printf("Latest version:  %s\n", release.TagName)
+
+		if checkOnly {
+			if hasUpdate {
+				fmt.Println("\nA new version is available!")
+				fmt.Println("Run 'codebase update' to install it.")
+			}
+			return nil
+		}
+
+		if hasUpdate || force {
+			fmt.Println("\nDownloading and installing update...")
+			if err := u.Update(release); err != nil {
+				return fmt.Errorf("update failed: %w", err)
+			}
+			fmt.Printf("\nSuccessfully updated to version %s\n", release.TagName)
+		}
+
+		return nil
+	},
+}
+
 func init() {
 	indexCmd.Flags().String("dir", ".", "Project root directory")
 	queryCmd.Flags().String("q", "", "Natural language query")
@@ -152,10 +214,15 @@ func init() {
 	mcpCmd.Flags().String("dir", ".", "Project root directory (server scopes searches to this directory)")
 	clearIndexCmd.Flags().String("dir", ".", "Project root directory to clear from Qdrant")
 
+	updateCmd.Flags().Bool("check", false, "Check for updates without installing")
+	updateCmd.Flags().Bool("force", false, "Force update even if already on latest version")
+
 	rootCmd.AddCommand(indexCmd)
 	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(queryCmd)
 	rootCmd.AddCommand(clearIndexCmd)
+	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(updateCmd)
 }
 
 func Execute() error {

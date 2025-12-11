@@ -45,9 +45,38 @@ These changes aim to combine AST structure with vector search so that the system
 
 ## Installation
 
+### Build from source (all platforms)
+
 ```bash
 go build -o codebase main.go
 ```
+
+### Install on Windows (prebuilt binary)
+
+Use the PowerShell script under `scripts/install-codebase.ps1` to download the latest release from GitHub, install it to a system directory, and configure environment variables.
+
+1. Open PowerShell **as Administrator** (required to write system environment variables).
+2. From the repository root, run:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\install-codebase.ps1
+   ```
+
+   By default this installs into `C:\mcp\codebase`. You can override the install directory:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\install-codebase.ps1 -InstallDir 'C:\mcp\codebase'
+   ```
+
+What the script does:
+
+- Fetches the latest `sxueck/codebase` release from GitHub and picks the Windows asset matching your architecture.
+- Downloads and extracts/copies it into the target install directory.
+- Sets `CODEBASE_HOME` (system-level) to the install directory.
+- Appends the install directory to the system `PATH` if it is not already present.
+- Ensures a config directory and file at `~/.codebase/config.json`:
+  - Creates `%USERPROFILE%\.codebase` if needed.
+  - Creates an empty `config.json` if it does not exist yet (you can edit this file later as needed).
 
 ## Prerequisites
 
