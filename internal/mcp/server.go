@@ -2,11 +2,9 @@ package mcp
 
 import (
 	"bufio"
-	"codebase/internal/analyzer"
 	"codebase/internal/config"
 	"codebase/internal/embeddings"
 	"codebase/internal/indexer"
-	"codebase/internal/llm"
 	"codebase/internal/models"
 	"codebase/internal/qdrant"
 	"codebase/internal/utils"
@@ -14,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -38,25 +35,26 @@ type RPCError struct {
 	Message string `json:"message"`
 }
 
-// SearchResult holds a code chunk with its fusion score for multi-query recall
-type SearchResult struct {
-	models.CodeChunkPayload
-	FusionScore float64
-	Rank        int
-}
-
-// QueryPlan alias for models.QueryPlan
-type QueryPlan = models.QueryPlan
-
-// CodeChunkPayload alias for models.CodeChunkPayload
+// CodeChunkPayload is kept for backwards compatibility with older code paths.
+// New code should reference models.CodeChunkPayload directly.
 type CodeChunkPayload = models.CodeChunkPayload
 
 type Server struct {
 	qdrantClient *qdrant.Client
 	embedClient  *embeddings.Client
-	llmClient    *llm.Client
-	analyzer     *analyzer.Analyzer
 	collection   string
+}
+
+// Close releases any resources held by the server. Safe to call multiple
+// times. Used by short-lived CLI commands that create a server for a
+// single request.
+func (s *Server) Close() {
+	if s == nil {
+		return
+	}
+	if s.qdrantClient != nil {
+		s.qdrantClient.Close()
+	}
 }
 
 func (s *Server) collectionName() string {
@@ -70,9 +68,10 @@ func NewServer(rootDir string) (*Server, error) {
 	// Best-effort load of shared config from ~/.codebase/config.json.
 	// Values from this file are applied as environment variables (if not
 	// already set) so that downstream clients can use the standard config
-	// layer based on env vars.
+	// layer based on env vars. Failures here should not prevent the server
+	// from starting as long as required env vars are set.
 	if err := config.LoadFromUserConfig(); err != nil {
-		return nil, err
+		fmt.Fprintf(os.Stderr, "[MCP WARN] Failed to load user config: %v\n", err)
 	}
 
 	qc, err := qdrant.NewClient()
@@ -87,20 +86,16 @@ func NewServer(rootDir string) (*Server, error) {
 	collection := indexer.CollectionName(projectID)
 
 	ec := embeddings.NewClient()
-	lc := llm.NewClient()
-	az := analyzer.NewAnalyzer(qc, lc, collection)
 
 	return &Server{
 		qdrantClient: qc,
 		embedClient:  ec,
-		llmClient:    lc,
-		analyzer:     az,
 		collection:   collection,
 	}, nil
 }
 
 func (s *Server) Run() error {
-	defer s.qdrantClient.Close()
+	defer s.Close()
 
 	reader := bufio.NewReader(os.Stdin)
 	writer := bufio.NewWriter(os.Stdout)
@@ -204,6 +199,10 @@ func (s *Server) handleToolsList(writer *bufio.Writer, req *JSONRPCRequest) {
 						"type":        "integer",
 						"description": "Maximum number of code snippets to return (default 10). Increase this when you need broader coverage of the relevant implementation (for example, 20–50 when exploring a feature area) and lower it when you only need the single most relevant location.",
 					},
+					"project_path": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional absolute path to the project root directory to search. If not provided, uses the default directory specified when starting the MCP server. Use this to search across different projects or repositories.",
+					},
 				},
 				"required": []string{"query"},
 			},
@@ -253,10 +252,16 @@ func (s *Server) handleCodebaseRetrieval(args json.RawMessage) (interface{}, err
 	return s.handleSearchCode(args)
 }
 
+// HandleCodebaseRetrieval is the exported version for CLI access
+func (s *Server) HandleCodebaseRetrieval(args json.RawMessage) (interface{}, error) {
+	return s.handleCodebaseRetrieval(args)
+}
+
 func (s *Server) handleSearchCode(args json.RawMessage) (interface{}, error) {
 	var input struct {
-		Query string `json:"query"`
-		TopK  int    `json:"top_k"`
+		Query       string `json:"query"`
+		TopK        int    `json:"top_k"`
+		ProjectPath string `json:"project_path"`
 	}
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, err
@@ -266,177 +271,37 @@ func (s *Server) handleSearchCode(args json.RawMessage) (interface{}, error) {
 		input.TopK = 10
 	}
 
-	// Step 1: Use LLM to build QueryPlan (intent recognition and query rewriting)
-	plan, err := s.llmClient.BuildQueryPlan(input.Query)
-	if err != nil {
-		// Fallback to simple search if LLM fails
-		return s.simpleSearch(input.Query, input.TopK)
+	// Determine which collection to use based on project_path
+	collection := s.collectionName()
+	if input.ProjectPath != "" {
+		projectID, err := utils.ComputeProjectID(input.ProjectPath)
+		if err != nil {
+			return nil, fmt.Errorf("invalid project_path: %w", err)
+		}
+		collection = indexer.CollectionName(projectID)
 	}
 
-	// Step 2: Branch based on intent type
-	switch plan.Intent {
-	case "DUPLICATE":
-		return s.handleDuplicateIntent(plan)
-	case "SEARCH", "REFACTOR", "BUG_PATTERN":
-		return s.handleSemanticIntent(plan, input.TopK)
-	default:
-		// Unknown intent, fallback to simple search
-		return s.simpleSearch(input.Query, input.TopK)
-	}
+	// Perform simple semantic search without query planning
+	return s.simpleSearchWithCollection(input.Query, input.TopK, collection)
 }
 
 // simpleSearch performs basic semantic search without query planning
 func (s *Server) simpleSearch(query string, topK int) (interface{}, error) {
+	return s.simpleSearchWithCollection(query, topK, s.collectionName())
+}
+
+// simpleSearchWithCollection performs basic semantic search on a specific collection
+func (s *Server) simpleSearchWithCollection(query string, topK int, collection string) (interface{}, error) {
 	vec, err := s.embedClient.Embed(query)
 	if err != nil {
 		return nil, err
 	}
 
-	results, err := s.qdrantClient.Search(s.collectionName(), vec, uint64(topK))
+	results, err := s.qdrantClient.Search(collection, vec, uint64(topK))
 	if err != nil {
 		return nil, err
 	}
-
 	return results, nil
-}
-
-// handleDuplicateIntent processes duplicate detection queries
-func (s *Server) handleDuplicateIntent(plan *QueryPlan) (interface{}, error) {
-	duplicates, err := s.analyzer.FindDuplicates(*plan)
-	if err != nil {
-		return nil, err
-	}
-
-	return map[string]interface{}{
-		"intent":     "DUPLICATE",
-		"duplicates": duplicates,
-	}, nil
-}
-
-// handleSemanticIntent processes semantic search with multi-query recall and fusion
-func (s *Server) handleSemanticIntent(plan *QueryPlan, topK int) (interface{}, error) {
-	if len(plan.SubQueries) == 0 {
-		return nil, fmt.Errorf("no sub-queries in plan")
-	}
-
-	// Multi-query recall: embed and search each sub-query
-	allResults := make(map[string]*SearchResult)
-
-	for _, subQuery := range plan.SubQueries {
-		vec, err := s.embedClient.Embed(subQuery)
-		if err != nil {
-			continue // Skip failed embeddings
-		}
-
-		scoredPoints, err := s.qdrantClient.Search(s.collectionName(), vec, uint64(topK*2))
-		if err != nil {
-			continue // Skip failed searches
-		}
-
-		// Merge results with reciprocal rank fusion
-		for _, point := range scoredPoints {
-			// Extract payload as CodeChunkPayload
-			payloadMap := qdrant.PayloadToMap(point.Payload)
-			data, _ := json.Marshal(payloadMap)
-			var chunk models.CodeChunkPayload
-			if err := json.Unmarshal(data, &chunk); err != nil {
-				continue
-			}
-
-			key := chunk.CodeHash
-			if existing, ok := allResults[key]; ok {
-				existing.FusionScore += float64(point.Score)
-				existing.Rank++
-			} else {
-				allResults[key] = &SearchResult{
-					CodeChunkPayload: chunk,
-					FusionScore:      float64(point.Score),
-					Rank:             1,
-				}
-			}
-		}
-	}
-
-	// Sort by fusion score and apply filter
-	sortedResults := make([]*SearchResult, 0, len(allResults))
-	for _, result := range allResults {
-		if matchesFilter(result.CodeChunkPayload, plan.Filter) {
-			sortedResults = append(sortedResults, result)
-		}
-	}
-
-	// Sort by fusion score descending
-	sort.Slice(sortedResults, func(i, j int) bool {
-		return sortedResults[i].FusionScore > sortedResults[j].FusionScore
-	})
-
-	// Limit to topK
-	if len(sortedResults) > topK {
-		sortedResults = sortedResults[:topK]
-	}
-
-	// Extract final results
-	finalResults := make([]CodeChunkPayload, len(sortedResults))
-	for i, result := range sortedResults {
-		finalResults[i] = result.CodeChunkPayload
-	}
-
-	return map[string]interface{}{
-		"intent":  plan.Intent,
-		"results": finalResults,
-	}, nil
-}
-
-// matchesFilter checks if a code chunk matches the given filter criteria
-func matchesFilter(chunk models.CodeChunkPayload, filter models.QueryFilter) bool {
-	if len(filter.Languages) > 0 {
-		found := false
-		for _, lang := range filter.Languages {
-			if chunk.Language == lang {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-
-	if len(filter.PathPrefix) > 0 {
-		found := false
-		for _, prefix := range filter.PathPrefix {
-			if strings.HasPrefix(chunk.FilePath, prefix) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-
-	if len(filter.NodeTypes) > 0 {
-		found := false
-		for _, nodeType := range filter.NodeTypes {
-			if chunk.NodeType == nodeType {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-
-	lines := chunk.EndLine - chunk.StartLine + 1
-	if filter.MinLines > 0 && lines < filter.MinLines {
-		return false
-	}
-	if filter.MaxLines > 0 && lines > filter.MaxLines {
-		return false
-	}
-
-	return true
 }
 
 func (s *Server) writeResponse(writer *bufio.Writer, id interface{}, result interface{}) {

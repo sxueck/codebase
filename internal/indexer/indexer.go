@@ -246,6 +246,18 @@ func (idx *Indexer) processFile(path string) error {
 		if len(fn.Callees) > 0 {
 			metaLines = append(metaLines, fmt.Sprintf("callees: %s", strings.Join(fn.Callees, ", ")))
 		}
+		// Add parameter types
+		if len(fn.ParamTypes) > 0 {
+			metaLines = append(metaLines, fmt.Sprintf("param_types: %s", strings.Join(fn.ParamTypes, ", ")))
+		}
+		// Add return types
+		if len(fn.ReturnTypes) > 0 {
+			metaLines = append(metaLines, fmt.Sprintf("return_types: %s", strings.Join(fn.ReturnTypes, ", ")))
+		}
+		// Add error handling flag
+		if fn.HasErrorReturn {
+			metaLines = append(metaLines, "has_error_return: true")
+		}
 
 		text := fmt.Sprintf("%s\n\n%s", strings.Join(metaLines, "\n"), fn.Content)
 		contents = append(contents, text)
@@ -262,37 +274,43 @@ func (idx *Indexer) processFile(path string) error {
 		hash := utils.HashContent(fn.Content)
 		id := contentHashToPointID(hash)
 		payload := models.CodeChunkPayload{
-			FilePath:    normalizedPath,
-			Language:    lang,
-			NodeType:    fn.NodeType,
-			NodeName:    fn.Name,
-			StartLine:   fn.StartLine,
-			EndLine:     fn.EndLine,
-			CodeHash:    hash,
-			Content:     fn.Content,
-			PackageName: fn.PackageName,
-			Imports:     fn.Imports,
-			Signature:   fn.Signature,
-			Receiver:    fn.Receiver,
-			Doc:         fn.Doc,
-			Callees:     fn.Callees,
+			FilePath:       normalizedPath,
+			Language:       lang,
+			NodeType:       fn.NodeType,
+			NodeName:       fn.Name,
+			StartLine:      fn.StartLine,
+			EndLine:        fn.EndLine,
+			CodeHash:       hash,
+			Content:        fn.Content,
+			PackageName:    fn.PackageName,
+			Imports:        fn.Imports,
+			Signature:      fn.Signature,
+			Receiver:       fn.Receiver,
+			Doc:            fn.Doc,
+			Callees:        fn.Callees,
+			ParamTypes:     fn.ParamTypes,
+			ReturnTypes:    fn.ReturnTypes,
+			HasErrorReturn: fn.HasErrorReturn,
 		}
 
 		payloadMap := map[string]interface{}{
-			"file_path":    payload.FilePath,
-			"language":     payload.Language,
-			"node_type":    payload.NodeType,
-			"node_name":    payload.NodeName,
-			"start_line":   payload.StartLine,
-			"end_line":     payload.EndLine,
-			"code_hash":    payload.CodeHash,
-			"content":      payload.Content,
-			"package_name": payload.PackageName,
-			"imports":      payload.Imports,
-			"signature":    payload.Signature,
-			"receiver":     payload.Receiver,
-			"doc":          payload.Doc,
-			"callees":      payload.Callees,
+			"file_path":        payload.FilePath,
+			"language":         payload.Language,
+			"node_type":        payload.NodeType,
+			"node_name":        payload.NodeName,
+			"start_line":       payload.StartLine,
+			"end_line":         payload.EndLine,
+			"code_hash":        payload.CodeHash,
+			"content":          payload.Content,
+			"package_name":     payload.PackageName,
+			"imports":          payload.Imports,
+			"signature":        payload.Signature,
+			"receiver":         payload.Receiver,
+			"doc":              payload.Doc,
+			"callees":          payload.Callees,
+			"param_types":      payload.ParamTypes,
+			"return_types":     payload.ReturnTypes,
+			"has_error_return": payload.HasErrorReturn,
 		}
 
 		points = append(points, &qdrantpb.PointStruct{

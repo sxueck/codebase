@@ -84,30 +84,28 @@ var queryCmd = &cobra.Command{
 			topK = 10
 		}
 
-		projectID, err := utils.ComputeProjectID(dir)
-		if err != nil {
-			return fmt.Errorf("failed to compute project id: %w", err)
-		}
-		collection := indexer.CollectionName(projectID)
-
-		qc, err := qdrant.NewClient()
+		// Create MCP server to reuse the same search logic
+		server, err := mcp.NewServer(dir)
 		if err != nil {
 			return err
 		}
-		defer qc.Close()
+		defer server.Close()
 
-		ec := embeddings.NewClient()
-		vec, err := ec.Embed(q)
-		if err != nil {
-			return err
+		// Use the same search logic as MCP
+		queryArgs := map[string]interface{}{
+			"query":        q,
+			"top_k":        topK,
+			"project_path": dir,
 		}
+		argsJSON, _ := json.Marshal(queryArgs)
 
-		results, err := qc.Search(collection, vec, uint64(topK))
+		result, err := server.HandleCodebaseRetrieval(argsJSON)
 		if err != nil {
 			return err
 		}
 
-		data, _ := json.MarshalIndent(results, "", "  ")
+		// Format output consistently
+		data, _ := json.MarshalIndent(result, "", "  ")
 		fmt.Println(string(data))
 
 		return nil

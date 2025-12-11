@@ -2,7 +2,6 @@ package analyzer
 
 import (
 	"codebase/internal/indexer"
-	"codebase/internal/llm"
 	"codebase/internal/models"
 	"codebase/internal/qdrant"
 	"codebase/internal/utils"
@@ -13,14 +12,12 @@ import (
 
 type Analyzer struct {
 	qdrant     *qdrant.Client
-	llm        *llm.Client
 	collection string
 }
 
-func NewAnalyzer(qc *qdrant.Client, lc *llm.Client, collection string) *Analyzer {
+func NewAnalyzer(qc *qdrant.Client, _ interface{}, collection string) *Analyzer {
 	return &Analyzer{
 		qdrant:     qc,
-		llm:        lc,
 		collection: collection,
 	}
 }
@@ -93,18 +90,9 @@ func (a *Analyzer) fetchAllVectors(filter models.QueryFilter) ([]models.CodeChun
 }
 
 func (a *Analyzer) filterDuplicatePairs(candidates []models.PairCandidate) []models.PairCandidate {
-	var confirmed []models.PairCandidate
-	for _, candidate := range candidates {
-		isDup, reason, err := a.llm.ClassifyDuplicatePair(candidate.A, candidate.B, candidate.Score)
-		if err != nil {
-			continue
-		}
-		if isDup {
-			candidate.A.Content = reason
-			confirmed = append(confirmed, candidate)
-		}
-	}
-	return confirmed
+	// Directly return candidates that have passed the threshold check
+	// No LLM-based secondary classification needed
+	return candidates
 }
 
 func matchesFilter(chunk models.CodeChunkPayload, filter models.QueryFilter) bool {
@@ -194,6 +182,7 @@ func buildDuplicateGroups(pairs []models.PairCandidate) []models.DuplicateGroup 
 	}
 
 	groups := make(map[string]*models.DuplicateGroup)
+	groupScores := make(map[string][]float64)
 	chunkMap := make(map[string]models.CodeChunkPayload)
 
 	for _, pair := range pairs {
@@ -205,15 +194,27 @@ func buildDuplicateGroups(pairs []models.PairCandidate) []models.DuplicateGroup 
 			groups[root] = &models.DuplicateGroup{
 				Chunks:   []models.CodeChunkPayload{},
 				AvgScore: 0,
-				Reason:   pair.A.Content,
+				Reason:   "Code similarity detected based on semantic analysis",
 			}
 		}
+		groupScores[root] = append(groupScores[root], pair.Score)
 	}
 
 	for hash := range chunkMap {
 		root := find(hash)
 		if group, ok := groups[root]; ok {
 			group.Chunks = append(group.Chunks, chunkMap[hash])
+		}
+	}
+
+	// Compute average score per group
+	for root, group := range groups {
+		if scores, ok := groupScores[root]; ok && len(scores) > 0 {
+			var sum float64
+			for _, s := range scores {
+				sum += s
+			}
+			group.AvgScore = sum / float64(len(scores))
 		}
 	}
 

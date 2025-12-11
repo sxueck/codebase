@@ -85,20 +85,32 @@ func (p *GoParser) buildFunctionNode(decl *ast.FuncDecl, pkg string, imports []s
 	content := string(code[startPos.Offset:endPos.Offset])
 	signature := formatFunctionSignature(decl)
 
+	// Extract parameter types
+	paramTypes := extractParamTypes(decl.Type)
+
+	// Extract return types
+	returnTypes := extractReturnTypes(decl.Type)
+
+	// Check if function returns error
+	hasErrorReturn := containsErrorReturn(returnTypes)
+
 	return &FunctionNode{
-		Name:        name,
-		NodeType:    nodeType,
-		StartLine:   startPos.Line,
-		EndLine:     endPos.Line,
-		Content:     content,
-		StartByte:   startPos.Offset,
-		EndByte:     endPos.Offset,
-		PackageName: pkg,
-		Imports:     append([]string(nil), imports...),
-		Signature:   signature,
-		Receiver:    receiverType,
-		Doc:         doc,
-		Callees:     callees,
+		Name:           name,
+		NodeType:       nodeType,
+		StartLine:      startPos.Line,
+		EndLine:        endPos.Line,
+		Content:        content,
+		StartByte:      startPos.Offset,
+		EndByte:        endPos.Offset,
+		PackageName:    pkg,
+		Imports:        append([]string(nil), imports...),
+		Signature:      signature,
+		Receiver:       receiverType,
+		Doc:            doc,
+		Callees:        callees,
+		ParamTypes:     paramTypes,
+		ReturnTypes:    returnTypes,
+		HasErrorReturn: hasErrorReturn,
 	}
 }
 
@@ -241,4 +253,62 @@ func formatCallExpr(expr ast.Expr) string {
 	default:
 		return strings.TrimSpace(types.ExprString(expr))
 	}
+}
+
+// extractParamTypes extracts the types of function parameters
+func extractParamTypes(funcType *ast.FuncType) []string {
+	if funcType == nil || funcType.Params == nil || len(funcType.Params.List) == 0 {
+		return nil
+	}
+
+	var paramTypes []string
+	for _, field := range funcType.Params.List {
+		if field.Type != nil {
+			typeStr := types.ExprString(field.Type)
+			// If there are multiple names with same type, add the type for each
+			if len(field.Names) > 0 {
+				for range field.Names {
+					paramTypes = append(paramTypes, typeStr)
+				}
+			} else {
+				// Unnamed parameter
+				paramTypes = append(paramTypes, typeStr)
+			}
+		}
+	}
+	return paramTypes
+}
+
+// extractReturnTypes extracts the types of function return values
+func extractReturnTypes(funcType *ast.FuncType) []string {
+	if funcType == nil || funcType.Results == nil || len(funcType.Results.List) == 0 {
+		return nil
+	}
+
+	var returnTypes []string
+	for _, field := range funcType.Results.List {
+		if field.Type != nil {
+			typeStr := types.ExprString(field.Type)
+			// If there are multiple names with same type, add the type for each
+			if len(field.Names) > 0 {
+				for range field.Names {
+					returnTypes = append(returnTypes, typeStr)
+				}
+			} else {
+				// Unnamed return value
+				returnTypes = append(returnTypes, typeStr)
+			}
+		}
+	}
+	return returnTypes
+}
+
+// containsErrorReturn checks if the return types include an error
+func containsErrorReturn(returnTypes []string) bool {
+	for _, t := range returnTypes {
+		if t == "error" {
+			return true
+		}
+	}
+	return false
 }

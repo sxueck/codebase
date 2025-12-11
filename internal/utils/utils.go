@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -171,7 +172,8 @@ func isIgnoredPath(relPath string, patterns []string) bool {
 
 // NormalizeProjectRoot resolves the provided path to an absolute, cleaned
 // directory so project-level identifiers remain stable regardless of how the
-// CLI is invoked.
+// CLI is invoked. On Windows, the path is lowercased to ensure consistent
+// hash generation regardless of drive letter case.
 func NormalizeProjectRoot(rootPath string) (string, error) {
 	if rootPath == "" {
 		rootPath = "."
@@ -180,7 +182,16 @@ func NormalizeProjectRoot(rootPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Clean(absPath), nil
+	normalized := filepath.Clean(absPath)
+
+	// On Windows, convert to lowercase to ensure consistent hash generation
+	// since Windows file systems are case-insensitive but Go's filepath.Abs
+	// preserves the case of the input drive letter.
+	if runtime.GOOS == "windows" {
+		normalized = strings.ToLower(normalized)
+	}
+
+	return normalized, nil
 }
 
 // ComputeProjectID returns a stable hash for the given project root path.
