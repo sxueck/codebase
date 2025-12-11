@@ -6,14 +6,20 @@ import (
 	"codebase/internal/embeddings"
 	"codebase/internal/indexer"
 	"codebase/internal/models"
+	"codebase/internal/parser"
 	"codebase/internal/qdrant"
 	"codebase/internal/utils"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 type JSONRPCRequest struct {
@@ -43,6 +49,13 @@ type Server struct {
 	qdrantClient *qdrant.Client
 	embedClient  *embeddings.Client
 	collection   string
+
+	rootDir string
+	indexer *indexer.Indexer
+
+	watcher   *fsnotify.Watcher
+	watchDone chan struct{}
+	watchWg   sync.WaitGroup
 }
 
 // Close releases any resources held by the server. Safe to call multiple
@@ -51,6 +64,13 @@ type Server struct {
 func (s *Server) Close() {
 	if s == nil {
 		return
+	}
+	if s.watcher != nil {
+		if s.watchDone != nil {
+			close(s.watchDone)
+		}
+		s.watchWg.Wait()
+		_ = s.watcher.Close()
 	}
 	if s.qdrantClient != nil {
 		s.qdrantClient.Close()
@@ -87,11 +107,25 @@ func NewServer(rootDir string) (*Server, error) {
 
 	ec := embeddings.NewClient()
 
-	return &Server{
+	s := &Server{
 		qdrantClient: qc,
 		embedClient:  ec,
 		collection:   collection,
-	}, nil
+		rootDir:      rootDir,
+	}
+
+	idx := indexer.NewIndexer(qc, ec)
+	idx.RegisterParser(string(parser.LanguageGo), parser.NewGoParser())
+	idx.RegisterParser(string(parser.LanguagePython), parser.NewPythonParser())
+	idx.RegisterParser(string(parser.LanguageJavaScript), parser.NewJavaScriptParser())
+	idx.RegisterParser(string(parser.LanguageTypeScript), parser.NewTypeScriptParser())
+	s.indexer = idx
+
+	if err := s.startWatcher(); err != nil {
+		fmt.Fprintf(os.Stderr, "[MCP WARN] Failed to start file watcher: %v\n", err)
+	}
+
+	return s, nil
 }
 
 func (s *Server) Run() error {
@@ -186,13 +220,13 @@ func (s *Server) handlePing(writer *bufio.Writer, req *JSONRPCRequest) {
 func (s *Server) handleToolsList(writer *bufio.Writer, req *JSONRPCRequest) {
 	tools := []map[string]interface{}{
 		{
-			"name": "codebase-retrieval",
+			"name":        "codebase-retrieval",
 			"description": "Primary MCP for this repo. Before attempting ANY code retrieval, requirement analysis, or contextual grounding for a user request, you must call this tool once. It performs semantic code search over the indexed repository so answers stay anchored to real code instead of assumptions.",
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"query": map[string]interface{}{
-						"type": "string",
+						"type":        "string",
 						"description": "Natural language description of what you need to inspect in this repo. Always populate this and call the tool first whenever (a) a user asks for code search, diffing, or refactors, or (b) you need to understand user requirements by locating related context in the codebase. Include specific symbols/files/features to maximize recall.",
 					},
 					"top_k": map[string]interface{}{
@@ -373,4 +407,124 @@ func writeMessage(writer *bufio.Writer, data []byte) {
 	writer.Write(data)
 	writer.WriteByte('\n')
 	writer.Flush()
+}
+
+// startWatcher sets up a recursive file watcher rooted at the server's
+// project directory and spawns a goroutine that debounces change events
+// and triggers incremental re-indexing.
+func (s *Server) startWatcher() error {
+	if strings.TrimSpace(s.rootDir) == "" || s.indexer == nil {
+		return nil
+	}
+
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+
+	// Watch all existing directories under rootDir.
+	if err := filepath.WalkDir(s.rootDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		return w.Add(path)
+	}); err != nil {
+		_ = w.Close()
+		return err
+	}
+
+	s.watcher = w
+	s.watchDone = make(chan struct{})
+
+	s.watchWg.Add(1)
+	go s.watchLoop()
+
+	return nil
+}
+
+func (s *Server) watchLoop() {
+	defer s.watchWg.Done()
+
+	if s.watcher == nil {
+		return
+	}
+
+	// Debounce rapid change bursts into a single incremental index run.
+	debounce := 5 * time.Second
+	reindexRequested := false
+	timer := time.NewTimer(debounce)
+	if !timer.Stop() {
+		<-timer.C
+	}
+
+	for {
+		select {
+		case <-s.watchDone:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case ev, ok := <-s.watcher.Events:
+			if !ok {
+				return
+			}
+
+			// If a new directory is created, start watching it as well.
+			if ev.Op&fsnotify.Create == fsnotify.Create {
+				fi, err := os.Stat(ev.Name)
+				if err == nil && fi.IsDir() {
+					_ = filepath.WalkDir(ev.Name, func(path string, d os.DirEntry, err error) error {
+						if err != nil {
+							return nil
+						}
+						if d.IsDir() {
+							_ = s.watcher.Add(path)
+						}
+						return nil
+					})
+				}
+			}
+
+			// Any create/write/remove/rename event is a signal that the
+			// on-disk state may have changed; schedule an incremental index.
+			if ev.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) != 0 {
+				reindexRequested = true
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				_ = timer.Reset(debounce)
+			}
+		case <-timer.C:
+			if reindexRequested {
+				reindexRequested = false
+				s.runIncrementalIndex()
+			}
+			_ = timer.Reset(debounce)
+		}
+	}
+}
+
+// runIncrementalIndex invokes the existing IndexProject implementation,
+// which updates changed files and removes vectors for deleted files so
+// that old data does not affect future reads.
+func (s *Server) runIncrementalIndex() {
+	if s.indexer == nil || strings.TrimSpace(s.rootDir) == "" {
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "[MCP] Detected file changes, running incremental index...\n")
+	if err := s.indexer.IndexProject(s.rootDir); err != nil {
+		fmt.Fprintf(os.Stderr, "[MCP WARN] Incremental index failed: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "[MCP] Incremental index completed.\n")
+	}
 }

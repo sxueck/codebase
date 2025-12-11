@@ -5,6 +5,7 @@ go 1.25.1
 require (
 	github.com/qdrant/go-client v1.16.2
 	github.com/sashabaranov/go-openai v1.41.2
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/spf13/cobra v1.10.2
 	google.golang.org/grpc v1.77.0
 )
