@@ -2,7 +2,9 @@ package parser
 
 import (
 	"bytes"
+	"regexp"
 	"sort"
+	"strings"
 	"unicode"
 )
 
@@ -676,14 +678,27 @@ func (e *jsFunctionExtractor) appendFunction(name, nodeType string, start, end i
 		return
 	}
 	content := string(e.code[start:end])
+	// Enrich JS/TS function nodes with import list, a lightweight
+	// signature and detected callees so they carry similar metadata
+	// as Go functions into the vector index.
+	imports := extractJSImports(e.code)
+	signature := deriveJSSignature(content, name)
+	callees := extractJSCallees(content)
+
 	e.functions = append(e.functions, FunctionNode{
-		Name:      name,
-		NodeType:  nodeType,
-		StartLine: startLine,
-		EndLine:   endLine,
-		Content:   content,
-		StartByte: start,
-		EndByte:   end,
+		Name:        name,
+		NodeType:    nodeType,
+		StartLine:   startLine,
+		EndLine:     endLine,
+		Content:     content,
+		StartByte:   start,
+		EndByte:     end,
+		PackageName: "", // Not modeled for JS/TS
+		Imports:     imports,
+		Signature:   signature,
+		Receiver:    "", // Methods are encoded in Name as Class.method
+		Doc:         "", // JSDoc comments are not yet extracted
+		Callees:     callees,
 	})
 }
 
@@ -709,6 +724,110 @@ func buildLineOffsets(code []byte) []int {
 	}
 	offsets = append(offsets, len(code)+1)
 	return offsets
+}
+
+// extractJSImports performs a lightweight scan of the whole file to gather
+// import/module references usable as metadata for each function.
+func extractJSImports(code []byte) []string {
+	var imports []string
+	lines := strings.Split(string(code), "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "import ") {
+			// ES module imports: import x from 'mod'; import {a} from 'mod';
+			// We keep the module specifier in quotes.
+			if idx := strings.LastIndexAny(trimmed, "'\""); idx >= 0 {
+				q := trimmed[idx]
+				start := strings.LastIndex(trimmed[:idx], string(q))
+				if start >= 0 && start < idx {
+					mod := trimmed[start+1 : idx]
+					if mod != "" {
+						imports = append(imports, mod)
+					}
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "const ") || strings.HasPrefix(trimmed, "let ") || strings.HasPrefix(trimmed, "var ") {
+			// CommonJS require: const x = require('mod')
+			if strings.Contains(trimmed, "require(") {
+				re := regexp.MustCompile(`require\(["']([^"']+)["']\)`)
+				if m := re.FindStringSubmatch(trimmed); len(m) == 2 {
+					imports = append(imports, m[1])
+				}
+			}
+		}
+	}
+	if len(imports) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(imports))
+	var dedup []string
+	for _, imp := range imports {
+		if _, ok := seen[imp]; ok {
+			continue
+		}
+		seen[imp] = struct{}{}
+		dedup = append(dedup, imp)
+	}
+	sort.Strings(dedup)
+	return dedup
+}
+
+// deriveJSSignature tries to build a minimal, readable signature of a
+// function from its source snippet and name.
+func deriveJSSignature(content, name string) string {
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") {
+			continue
+		}
+		if strings.Contains(trimmed, "function ") || strings.Contains(trimmed, "=>") {
+			// Use the line up to the opening brace or first "=>" as the signature
+			if idx := strings.Index(trimmed, "{"); idx >= 0 {
+				trimmed = strings.TrimSpace(trimmed[:idx])
+			}
+			if idx := strings.Index(trimmed, "=>"); idx >= 0 {
+				trimmed = strings.TrimSpace(trimmed[:idx+2])
+			}
+			return trimmed
+		}
+	}
+	if name == "" {
+		return ""
+	}
+	return name + "()"
+}
+
+// extractJSCallees performs a simple scan to find identifiers followed by
+// "(" which likely correspond to function calls.
+func extractJSCallees(content string) []string {
+	re := regexp.MustCompile(`([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`)
+	matches := re.FindAllStringSubmatch(content, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var callees []string
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		name := m[1]
+		if name == "if" || name == "for" || name == "while" || name == "switch" || name == "return" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		callees = append(callees, name)
+	}
+	return callees
 }
 
 func isIdentifierStart(ch byte) bool {
