@@ -169,8 +169,9 @@ var updateCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		force, _ := cmd.Flags().GetBool("force")
 		checkOnly, _ := cmd.Flags().GetBool("check")
+		mirror, _ := cmd.Flags().GetString("mirror")
 
-		u := updater.NewUpdater(Version)
+		u := updater.NewUpdater(Version, mirror)
 
 		fmt.Println("Checking for updates...")
 		release, hasUpdate, err := u.CheckForUpdate()
@@ -216,6 +217,7 @@ func init() {
 
 	updateCmd.Flags().Bool("check", false, "Check for updates without installing")
 	updateCmd.Flags().Bool("force", false, "Force update even if already on latest version")
+	updateCmd.Flags().String("mirror", "", "Mirror prefix for GitHub API and asset downloads, e.g. https://proxy.sxueck.cn")
 
 	rootCmd.AddCommand(indexCmd)
 	rootCmd.AddCommand(mcpCmd)

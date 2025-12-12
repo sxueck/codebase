@@ -37,15 +37,30 @@ type Updater struct {
 	currentVersion string
 	owner          string
 	repo           string
+	mirror         string
 }
 
 // NewUpdater creates a new updater instance
-func NewUpdater(currentVersion string) *Updater {
+func NewUpdater(currentVersion, mirror string) *Updater {
 	return &Updater{
 		currentVersion: currentVersion,
 		owner:          "sxueck",
 		repo:           "codebase",
+		mirror:         strings.TrimRight(mirror, "/"),
 	}
+}
+
+// withMirror prefixes the given URL with the configured mirror if present.
+// For example:
+//   mirror: https://proxy.example.com
+//   url:    https://api.github.com/...
+// Result:
+//   https://proxy.example.com/https://api.github.com/...
+func (u *Updater) withMirror(url string) string {
+	if u.mirror == "" {
+		return url
+	}
+	return u.mirror + "/" + url
 }
 
 // CheckForUpdate checks if a new version is available
@@ -76,7 +91,7 @@ func (u *Updater) getLatestRelease() (*Release, error) {
 		Timeout: 30 * time.Second,
 	}
 
-	req, err := http.NewRequest("GET", githubAPIURL, nil)
+	req, err := http.NewRequest("GET", u.withMirror(githubAPIURL), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +184,7 @@ func (u *Updater) downloadAsset(asset *Asset) (string, error) {
 		Timeout: 5 * time.Minute,
 	}
 
-	req, err := http.NewRequest("GET", asset.BrowserDownloadURL, nil)
+	req, err := http.NewRequest("GET", u.withMirror(asset.BrowserDownloadURL), nil)
 	if err != nil {
 		return "", err
 	}
