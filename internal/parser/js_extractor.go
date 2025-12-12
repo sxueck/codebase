@@ -14,6 +14,7 @@ type jsFunctionExtractor struct {
 	pos         int
 	lineOffsets []int
 	functions   []FunctionNode
+	imports     []string
 }
 
 func extractJSFunctions(code []byte, tsAware bool) []FunctionNode {
@@ -21,6 +22,7 @@ func extractJSFunctions(code []byte, tsAware bool) []FunctionNode {
 		code:        code,
 		tsAware:     tsAware,
 		lineOffsets: buildLineOffsets(code),
+		imports:     extractJSImports(code),
 	}
 	extractor.scan()
 	return extractor.functions
@@ -152,13 +154,14 @@ func (e *jsFunctionExtractor) captureNamedFunction(start int) bool {
 		return false
 	}
 
+	paramStart := e.pos
 	paramsEnd := e.scanBalanced(e.pos, '(', ')')
 	if paramsEnd < 0 {
 		return false
 	}
 	e.pos = paramsEnd
 	e.skipWhitespaceComments()
-	e.skipOptionalTypeAnnotation()
+	returnType := e.skipOptionalTypeAnnotation()
 	e.skipWhitespaceComments()
 
 	if e.pos >= len(e.code) || e.code[e.pos] != '{' {
@@ -170,7 +173,8 @@ func (e *jsFunctionExtractor) captureNamedFunction(start int) bool {
 		return false
 	}
 
-	e.appendFunction(name, "function", funcStart, bodyEnd)
+	paramsText := string(e.code[paramStart:paramsEnd])
+	e.appendFunction(name, "function", funcStart, bodyEnd, paramsText, returnType)
 	e.pos = bodyEnd
 	return true
 }
@@ -187,13 +191,14 @@ func (e *jsFunctionExtractor) captureFunctionExpression(start int, name string) 
 		return false
 	}
 
+	paramStart := e.pos
 	paramsEnd := e.scanBalanced(e.pos, '(', ')')
 	if paramsEnd < 0 {
 		return false
 	}
 	e.pos = paramsEnd
 	e.skipWhitespaceComments()
-	e.skipOptionalTypeAnnotation()
+	returnType := e.skipOptionalTypeAnnotation()
 	e.skipWhitespaceComments()
 
 	if e.pos >= len(e.code) || e.code[e.pos] != '{' {
@@ -205,28 +210,32 @@ func (e *jsFunctionExtractor) captureFunctionExpression(start int, name string) 
 		return false
 	}
 
-	e.appendFunction(name, "function", start, bodyEnd)
+	paramsText := string(e.code[paramStart:paramsEnd])
+	e.appendFunction(name, "function", start, bodyEnd, paramsText, returnType)
 	e.pos = bodyEnd
 	return true
 }
 
 func (e *jsFunctionExtractor) captureArrowFunction(start int, name string) bool {
 	paramStart := e.pos
+	paramsText := ""
 	if e.pos < len(e.code) && e.code[e.pos] == '(' {
 		paramsEnd := e.scanBalanced(e.pos, '(', ')')
 		if paramsEnd < 0 {
 			return false
 		}
 		e.pos = paramsEnd
+		paramsText = string(e.code[paramStart:paramsEnd])
 	} else {
 		_, ok := e.readIdentifier()
 		if !ok {
 			return false
 		}
+		paramsText = string(e.code[paramStart:e.pos])
 	}
 
 	e.skipWhitespaceComments()
-	e.skipOptionalTypeAnnotation()
+	returnType := e.skipOptionalTypeAnnotation()
 	e.skipWhitespaceComments()
 
 	if e.pos+1 >= len(e.code) || e.code[e.pos] != '=' || e.code[e.pos+1] != '>' {
@@ -245,7 +254,7 @@ func (e *jsFunctionExtractor) captureArrowFunction(start int, name string) bool 
 		return false
 	}
 
-	e.appendFunction(name, "function", start, bodyEnd)
+	e.appendFunction(name, "function", start, bodyEnd, paramsText, returnType)
 	e.pos = bodyEnd
 	return true
 }
@@ -310,13 +319,14 @@ func (e *jsFunctionExtractor) extractClassMethods(className string, bodyStart, b
 			continue
 		}
 
+		paramStart := e.pos
 		paramsEnd := e.scanBalanced(e.pos, '(', ')')
 		if paramsEnd < 0 {
 			break
 		}
 		e.pos = paramsEnd
 		e.skipWhitespaceComments()
-		e.skipOptionalTypeAnnotation()
+		returnType := e.skipOptionalTypeAnnotation()
 		e.skipWhitespaceComments()
 
 		if e.pos >= len(e.code) || e.code[e.pos] != '{' {
@@ -337,7 +347,8 @@ func (e *jsFunctionExtractor) extractClassMethods(className string, bodyStart, b
 			funcName = className
 		}
 
-		e.appendFunction(funcName, "method", start, methodEnd)
+		paramsText := string(e.code[paramStart:paramsEnd])
+		e.appendFunction(funcName, "method", start, methodEnd, paramsText, returnType)
 		pos = methodEnd
 	}
 }
@@ -537,15 +548,16 @@ func (e *jsFunctionExtractor) scanBalanced(start int, open, close byte) int {
 	return -1
 }
 
-func (e *jsFunctionExtractor) skipOptionalTypeAnnotation() {
+func (e *jsFunctionExtractor) skipOptionalTypeAnnotation() string {
 	if !e.tsAware {
-		return
+		return ""
 	}
 	if e.pos >= len(e.code) || e.code[e.pos] != ':' {
-		return
+		return ""
 	}
 
 	e.pos++
+	start := e.pos
 	depth := 0
 	firstToken := true
 	for e.pos < len(e.code) {
@@ -556,58 +568,66 @@ func (e *jsFunctionExtractor) skipOptionalTypeAnnotation() {
 			continue
 		}
 		if ch == '\n' && depth == 0 {
-			return
-		}
-		if firstToken && ch != '\n' {
-			firstToken = false
+			return strings.TrimSpace(string(e.code[start:e.pos]))
 		}
 		switch ch {
 		case '{':
 			if depth == 0 && !firstToken {
-				return
+				return strings.TrimSpace(string(e.code[start:e.pos]))
 			}
+			firstToken = false
 			depth++
 		case '}':
 			if depth > 0 {
 				depth--
 			} else {
-				return
+				return strings.TrimSpace(string(e.code[start:e.pos]))
 			}
 		case '<':
+			firstToken = false
 			depth++
 		case '>':
 			if depth > 0 {
 				depth--
 			}
 		case '(':
+			firstToken = false
 			depth++
 		case ')':
 			if depth > 0 {
 				depth--
 			}
 		case '[':
+			firstToken = false
 			depth++
 		case ']':
 			if depth > 0 {
 				depth--
 			}
 		case '"', '\'':
+			firstToken = false
 			e.skipStringLiteral(ch)
 			continue
 		case '`':
+			firstToken = false
 			e.skipTemplateLiteral()
 			continue
 		case '\n', ';':
 			if depth == 0 {
-				return
+				return strings.TrimSpace(string(e.code[start:e.pos]))
 			}
 		case '=':
 			if depth == 0 {
-				return
+				return strings.TrimSpace(string(e.code[start:e.pos]))
+			}
+		default:
+			if firstToken && ch != '\n' {
+				firstToken = false
 			}
 		}
 		e.pos++
 	}
+	return strings.TrimSpace(string(e.code[start:e.pos]))
 }
 
 func (e *jsFunctionExtractor) matchKeyword(word string) int {
@@ -668,7 +688,7 @@ func (e *jsFunctionExtractor) readIdentifier() (string, bool) {
 	return string(e.code[start:e.pos]), true
 }
 
-func (e *jsFunctionExtractor) appendFunction(name, nodeType string, start, end int) {
+func (e *jsFunctionExtractor) appendFunction(name, nodeType string, start, end int, paramsText, returnAnnotation string) {
 	if end <= start {
 		return
 	}
@@ -681,9 +701,12 @@ func (e *jsFunctionExtractor) appendFunction(name, nodeType string, start, end i
 	// Enrich JS/TS function nodes with import list, a lightweight
 	// signature and detected callees so they carry similar metadata
 	// as Go functions into the vector index.
-	imports := extractJSImports(e.code)
+	imports := append([]string(nil), e.imports...)
 	signature := deriveJSSignature(content, name)
 	callees := extractJSCallees(content)
+	doc := e.extractDocComment(start)
+	paramTypes := parseJSParamTypes(paramsText, e.tsAware)
+	returnTypes := parseJSReturnTypes(returnAnnotation)
 
 	e.functions = append(e.functions, FunctionNode{
 		Name:        name,
@@ -697,9 +720,353 @@ func (e *jsFunctionExtractor) appendFunction(name, nodeType string, start, end i
 		Imports:     imports,
 		Signature:   signature,
 		Receiver:    "", // Methods are encoded in Name as Class.method
-		Doc:         "", // JSDoc comments are not yet extracted
+		Doc:         doc,
 		Callees:     callees,
+		ParamTypes:  paramTypes,
+		ReturnTypes: returnTypes,
 	})
+}
+
+func parseJSReturnTypes(annotation string) []string {
+	annotation = strings.TrimSpace(annotation)
+	if annotation == "" {
+		return nil
+	}
+	return []string{annotation}
+}
+
+func parseJSParamTypes(paramsText string, tsAware bool) []string {
+	paramsText = strings.TrimSpace(paramsText)
+	if paramsText == "" {
+		return nil
+	}
+	if strings.HasPrefix(paramsText, "(") && strings.HasSuffix(paramsText, ")") {
+		paramsText = paramsText[1 : len(paramsText)-1]
+	}
+	parts := splitJSParameters(paramsText)
+	if len(parts) == 0 {
+		return nil
+	}
+	var result []string
+	for _, part := range parts {
+		part = strings.TrimSpace(stripJSDefaultValue(part))
+		if part == "" {
+			continue
+		}
+		if strings.HasPrefix(part, "...") {
+			part = strings.TrimSpace(part[3:])
+		}
+		part = stripJSParamModifiers(part)
+		descriptor := ""
+		if tsAware {
+			if idx := findTopLevelColon(part); idx >= 0 {
+				descriptor = strings.TrimSpace(part[idx+1:])
+			}
+		}
+		if descriptor == "" {
+			descriptor = sanitizeJSParamName(part)
+		}
+		result = append(result, descriptor)
+	}
+	return result
+}
+
+func splitJSParameters(params string) []string {
+	var parts []string
+	var current strings.Builder
+	depth := 0
+	inString := false
+	inLineComment := false
+	inBlockComment := false
+	var quote byte
+
+	flushPart := func() {
+		part := strings.TrimSpace(current.String())
+		if part != "" {
+			parts = append(parts, part)
+		} else {
+			parts = append(parts, "")
+		}
+		current.Reset()
+	}
+
+	for i := 0; i < len(params); i++ {
+		ch := params[i]
+
+		if inLineComment {
+			if ch == '\n' {
+				inLineComment = false
+				current.WriteByte(ch)
+			} else if ch == '\r' {
+				inLineComment = false
+				if i+1 >= len(params) || params[i+1] != '\n' {
+					current.WriteByte('\n')
+				}
+			}
+			continue
+		}
+		if inBlockComment {
+			if ch == '*' && i+1 < len(params) && params[i+1] == '/' {
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+
+		if inString {
+			current.WriteByte(ch)
+			if ch == '\\' {
+				if i+1 < len(params) {
+					current.WriteByte(params[i+1])
+					i++
+				}
+				continue
+			}
+			if ch == quote {
+				inString = false
+			}
+			continue
+		}
+
+		if ch == '/' && i+1 < len(params) {
+			next := params[i+1]
+			if next == '/' {
+				inLineComment = true
+				i++
+				continue
+			}
+			if next == '*' {
+				inBlockComment = true
+				i++
+				continue
+			}
+		}
+
+		switch ch {
+		case '\'', '"', '`':
+			inString = true
+			quote = ch
+			current.WriteByte(ch)
+		case '(', '[', '{', '<':
+			depth++
+			current.WriteByte(ch)
+		case ')', ']', '}', '>':
+			if depth > 0 {
+				depth--
+			}
+			current.WriteByte(ch)
+		case ',':
+			if depth == 0 {
+				flushPart()
+				continue
+			}
+			current.WriteByte(ch)
+		default:
+			current.WriteByte(ch)
+		}
+	}
+
+	if current.Len() > 0 {
+		last := strings.TrimSpace(current.String())
+		if last != "" {
+			parts = append(parts, last)
+		}
+	}
+	return parts
+}
+
+func stripJSDefaultValue(param string) string {
+	param = strings.TrimSpace(param)
+	if param == "" {
+		return ""
+	}
+	depth := 0
+	inString := false
+	var quote byte
+	for i := 0; i < len(param); i++ {
+		ch := param[i]
+		if inString {
+			if ch == '\\' {
+				i++
+				continue
+			}
+			if ch == quote {
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"', '`':
+			inString = true
+			quote = ch
+		case '(', '[', '{', '<':
+			depth++
+		case ')', ']', '}', '>':
+			if depth > 0 {
+				depth--
+			}
+		case '=':
+			if depth == 0 {
+				return strings.TrimSpace(param[:i])
+			}
+		}
+	}
+	return param
+}
+
+func stripJSParamModifiers(param string) string {
+	param = strings.TrimSpace(param)
+	if param == "" {
+		return ""
+	}
+	modifiers := []string{"public", "private", "protected", "readonly", "override", "abstract", "declare", "static"}
+	for {
+		trimmed := strings.TrimSpace(param)
+		removed := false
+		for _, mod := range modifiers {
+			if strings.HasPrefix(trimmed, mod+" ") {
+				param = strings.TrimSpace(trimmed[len(mod):])
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			return trimmed
+		}
+	}
+}
+
+func sanitizeJSParamName(param string) string {
+	param = strings.TrimSpace(param)
+	if param == "" {
+		return ""
+	}
+	if idx := findTopLevelColon(param); idx >= 0 {
+		param = strings.TrimSpace(param[:idx])
+	}
+	param = strings.TrimSpace(strings.TrimSuffix(param, "?"))
+	return param
+}
+
+func findTopLevelColon(param string) int {
+	depth := 0
+	inString := false
+	var quote byte
+	for i := 0; i < len(param); i++ {
+		ch := param[i]
+		if inString {
+			if ch == '\\' {
+				i++
+				continue
+			}
+			if ch == quote {
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"', '`':
+			inString = true
+			quote = ch
+		case '(', '[', '{', '<':
+			depth++
+		case ')', ']', '}', '>':
+			if depth > 0 {
+				depth--
+			}
+		case ':':
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func (e *jsFunctionExtractor) extractDocComment(start int) string {
+	line := e.lineForOffset(start)
+	if line <= 1 {
+		return ""
+	}
+	prevLine := line - 1
+	trimmed := strings.TrimSpace(e.lineText(prevLine))
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "//") {
+		return e.collectLineCommentDoc(prevLine)
+	}
+	if strings.HasSuffix(trimmed, "*/") {
+		return e.collectBlockCommentDoc(prevLine)
+	}
+	return ""
+}
+
+func (e *jsFunctionExtractor) collectLineCommentDoc(line int) string {
+	var lines []string
+	for line >= 1 {
+		text := strings.TrimSpace(e.lineText(line))
+		if !strings.HasPrefix(text, "//") {
+			break
+		}
+		comment := strings.TrimSpace(strings.TrimPrefix(text, "//"))
+		lines = append([]string{comment}, lines...)
+		line--
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func (e *jsFunctionExtractor) collectBlockCommentDoc(line int) string {
+	var lines []string
+	foundStart := false
+	for line >= 1 {
+		text := e.lineText(line)
+		lines = append([]string{text}, lines...)
+		if strings.Contains(text, "/*") {
+			foundStart = true
+			break
+		}
+		line--
+	}
+	if !foundStart {
+		return ""
+	}
+	raw := strings.Join(lines, "\n")
+	trimmed := strings.TrimSpace(raw)
+	if !strings.HasPrefix(trimmed, "/**") {
+		return ""
+	}
+	return cleanJSDocComment(trimmed)
+}
+
+func cleanJSDocComment(comment string) string {
+	comment = strings.TrimSpace(comment)
+	comment = strings.TrimPrefix(comment, "/**")
+	comment = strings.TrimPrefix(comment, "/*")
+	comment = strings.TrimSuffix(comment, "*/")
+	lines := strings.Split(comment, "\n")
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "*")
+		line = strings.TrimSpace(line)
+		lines[i] = line
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func (e *jsFunctionExtractor) lineText(line int) string {
+	if line <= 0 || line >= len(e.lineOffsets) {
+		return ""
+	}
+	start := e.lineOffsets[line-1]
+	end := e.lineOffsets[line] - 1
+	if end > len(e.code) {
+		end = len(e.code)
+	}
+	if end < start {
+		end = start
+	}
+	return string(e.code[start:end])
 }
 
 func (e *jsFunctionExtractor) lineForOffset(offset int) int {

@@ -24,9 +24,13 @@ jobs:
             goos: windows
             goarch: amd64
             ext: ".exe"
-          - os: macos-latest
+          - os: macos-13
             goos: darwin
             goarch: amd64
+            ext: ""
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
             ext: ""
 
     runs-on: ${{ matrix.os }}
