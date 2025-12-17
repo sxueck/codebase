@@ -50,8 +50,9 @@ type Server struct {
 	embedClient  *embeddings.Client
 	collection   string
 
-	rootDir string
-	indexer *indexer.Indexer
+	rootDir        string
+	indexer        *indexer.Indexer
+	ignorePatterns []string
 
 	watcher   *fsnotify.Watcher
 	watchDone chan struct{}
@@ -99,7 +100,12 @@ func NewServer(rootDir string) (*Server, error) {
 		return nil, err
 	}
 
-	projectID, err := utils.ComputeProjectID(rootDir)
+	normalizedRoot, err := utils.NormalizeProjectRoot(rootDir)
+	if err != nil {
+		return nil, err
+	}
+
+	projectID, err := utils.ComputeProjectID(normalizedRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -108,10 +114,11 @@ func NewServer(rootDir string) (*Server, error) {
 	ec := embeddings.NewClient()
 
 	s := &Server{
-		qdrantClient: qc,
-		embedClient:  ec,
-		collection:   collection,
-		rootDir:      rootDir,
+		qdrantClient:   qc,
+		embedClient:    ec,
+		collection:     collection,
+		rootDir:        normalizedRoot,
+		ignorePatterns: utils.LoadGitIgnorePatterns(normalizedRoot),
 	}
 
 	idx := indexer.NewIndexer(qc, ec)
@@ -409,6 +416,41 @@ func writeMessage(writer *bufio.Writer, data []byte) {
 	writer.Flush()
 }
 
+func (s *Server) shouldSkipWatchDir(path string) bool {
+	if s == nil || strings.TrimSpace(s.rootDir) == "" {
+		return false
+	}
+
+	relPath, err := filepath.Rel(s.rootDir, path)
+	if err != nil {
+		return true
+	}
+	relPath = filepath.ToSlash(relPath)
+	if strings.HasPrefix(relPath, "..") {
+		return true
+	}
+	return utils.ShouldSkipDir(relPath, filepath.Base(path), s.ignorePatterns)
+}
+
+func (s *Server) addWatcherForDir(path string) {
+	if s == nil || s.watcher == nil {
+		return
+	}
+	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if s.shouldSkipWatchDir(p) {
+			return filepath.SkipDir
+		}
+		_ = s.watcher.Add(p)
+		return nil
+	})
+}
+
 // startWatcher sets up a recursive file watcher rooted at the server's
 // project directory and spawns a goroutine that debounces change events
 // and triggers incremental re-indexing.
@@ -422,13 +464,16 @@ func (s *Server) startWatcher() error {
 		return err
 	}
 
-	// Watch all existing directories under rootDir.
+	// Watch all existing directories under rootDir except heavy or ignored paths.
 	if err := filepath.WalkDir(s.rootDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if !d.IsDir() {
 			return nil
+		}
+		if s.shouldSkipWatchDir(path) {
+			return filepath.SkipDir
 		}
 		return w.Add(path)
 	}); err != nil {
@@ -479,15 +524,7 @@ func (s *Server) watchLoop() {
 			if ev.Op&fsnotify.Create == fsnotify.Create {
 				fi, err := os.Stat(ev.Name)
 				if err == nil && fi.IsDir() {
-					_ = filepath.WalkDir(ev.Name, func(path string, d os.DirEntry, err error) error {
-						if err != nil {
-							return nil
-						}
-						if d.IsDir() {
-							_ = s.watcher.Add(path)
-						}
-						return nil
-					})
+					s.addWatcherForDir(ev.Name)
 				}
 			}
 

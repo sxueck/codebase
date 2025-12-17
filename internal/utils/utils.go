@@ -32,7 +32,7 @@ var languageExts = map[string]string{
 
 func GetAllSourceFiles(rootPath string) ([]string, error) {
 	var files []string
-	ignorePatterns := loadGitIgnorePatterns(rootPath)
+	ignorePatterns := LoadGitIgnorePatterns(rootPath)
 	err := filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -46,12 +46,7 @@ func GetAllSourceFiles(rootPath string) ([]string, error) {
 		relPath = filepath.ToSlash(relPath)
 
 		if d.IsDir() {
-			// Always skip well-known heavy/irrelevant directories.
-			if excludedDirs[d.Name()] {
-				return filepath.SkipDir
-			}
-			// Respect top-level .gitignore rules for directories.
-			if isIgnoredPath(relPath, ignorePatterns) {
+			if ShouldSkipDir(relPath, d.Name(), ignorePatterns) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -101,9 +96,9 @@ func NormalizeQuery(query string) string {
 	return strings.TrimSpace(query)
 }
 
-// loadGitIgnorePatterns reads the root-level .gitignore (if present) and
+// LoadGitIgnorePatterns reads the root-level .gitignore (if present) and
 // returns a list of non-empty, non-comment patterns.
-func loadGitIgnorePatterns(rootPath string) []string {
+func LoadGitIgnorePatterns(rootPath string) []string {
 	gitIgnorePath := filepath.Join(rootPath, ".gitignore")
 	data, err := os.ReadFile(gitIgnorePath)
 	if err != nil {
@@ -120,6 +115,25 @@ func loadGitIgnorePatterns(rootPath string) []string {
 		patterns = append(patterns, line)
 	}
 	return patterns
+}
+
+// ShouldSkipDir reports whether WalkDir should skip the provided directory when
+// indexing or watching for changes. It combines built-in exclusions (such as
+// node_modules/) with .gitignore-style rules rooted at the project directory.
+func ShouldSkipDir(relPath string, dirName string, patterns []string) bool {
+	relPath = strings.TrimSpace(relPath)
+	relPath = filepath.ToSlash(relPath)
+	if relPath == "." {
+		relPath = ""
+	}
+
+	if dirName != "" && excludedDirs[dirName] {
+		return true
+	}
+	if relPath == "" {
+		return false
+	}
+	return isIgnoredPath(relPath, patterns)
 }
 
 // isIgnoredPath applies a minimal subset of .gitignore semantics suitable for
