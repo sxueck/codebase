@@ -117,21 +117,6 @@ func (idx *Indexer) IndexProject(rootPath string) error {
 		return nil
 	}
 
-	// Detect vector size by creating a sample embedding
-	fmt.Println("→ Detecting vector dimensions...")
-	sampleVec, err := idx.embeddings.Embed("sample text for dimension detection")
-	if err != nil {
-		return fmt.Errorf("failed to detect vector dimensions: %w", err)
-	}
-	vectorSize := uint64(len(sampleVec))
-	fmt.Printf("✓ Detected vector dimension: %d\n", vectorSize)
-
-	// Ensure collection with detected vector size
-	if err := idx.qdrant.EnsureCollection(idx.collection, vectorSize); err != nil {
-		return err
-	}
-	fmt.Printf("✓ Collection '%s' ensured with dimension %d\n", idx.collection, vectorSize)
-
 	// Delete vectors for files that have been removed from the filesystem.
 	for _, normalizedPath := range deletedFiles {
 		displayPath := filepath.FromSlash(normalizedPath)
@@ -266,6 +251,16 @@ func (idx *Indexer) processFile(path string) error {
 	vectors, err := idx.embeddings.EmbedBatch(contents)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "✗ Error embedding %s: %v\n", path, err)
+		return err
+	}
+	if len(vectors) == 0 || len(vectors[0]) == 0 {
+		return fmt.Errorf("no embedding vectors returned for %s", path)
+	}
+
+	// Ensure Qdrant collection lazily using the actual embedding dimension so we
+	// don't need a separate probe request.
+	vectorSize := uint64(len(vectors[0]))
+	if err := idx.qdrant.EnsureCollection(idx.collection, vectorSize); err != nil {
 		return err
 	}
 
