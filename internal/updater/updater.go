@@ -50,12 +50,6 @@ func NewUpdater(currentVersion, mirror string) *Updater {
 	}
 }
 
-// withMirror prefixes the given URL with the configured mirror if present.
-// For example:
-//   mirror: https://proxy.example.com
-//   url:    https://api.github.com/...
-// Result:
-//   https://proxy.example.com/https://api.github.com/...
 func (u *Updater) withMirror(url string) string {
 	if u.mirror == "" {
 		return url
@@ -129,8 +123,8 @@ func (u *Updater) selectAsset(assets []Asset) (*Asset, error) {
 		if strings.Contains(name, goos) {
 			// For simple name matching
 			if strings.Contains(name, goarch) ||
-			   (goarch == "amd64" && (strings.Contains(name, "x86_64") || strings.Contains(name, "x64"))) ||
-			   (goarch == "386" && strings.Contains(name, "x86")) {
+				(goarch == "amd64" && (strings.Contains(name, "x86_64") || strings.Contains(name, "x64"))) ||
+				(goarch == "386" && strings.Contains(name, "x86")) {
 				return &asset, nil
 			}
 		}
@@ -235,8 +229,8 @@ func (u *Updater) updateFromZip(zipPath, execPath string) error {
 		name := filepath.Base(f.Name)
 		// Look for codebase.exe or codebase
 		if name == execName ||
-		   strings.HasPrefix(name, "codebase") &&
-		   (strings.HasSuffix(name, ".exe") || !strings.Contains(name, ".")) {
+			strings.HasPrefix(name, "codebase") &&
+				(strings.HasSuffix(name, ".exe") || !strings.Contains(name, ".")) {
 			binaryFile = f
 			break
 		}
@@ -285,11 +279,6 @@ func (u *Updater) replaceExecutable(newPath, execPath string) error {
 	}
 
 	if runtime.GOOS == "windows" {
-		// On Windows, we need to:
-		// 1. Rename the current executable to .old
-		// 2. Copy the new executable to the original location
-		// 3. The .old file will be deleted on next run
-
 		oldPath := execPath + ".old"
 
 		// Remove any existing .old file

@@ -131,7 +131,11 @@ var clearIndexCmd = &cobra.Command{
 		}
 
 		dir, _ := cmd.Flags().GetString("dir")
-		projectID, err := utils.ComputeProjectID(dir)
+		normalizedRoot, err := utils.NormalizeProjectRoot(dir)
+		if err != nil {
+			return fmt.Errorf("failed to normalize project root: %w", err)
+		}
+		projectID, err := utils.ComputeProjectID(normalizedRoot)
 		if err != nil {
 			return fmt.Errorf("failed to compute project id: %w", err)
 		}
@@ -146,6 +150,12 @@ var clearIndexCmd = &cobra.Command{
 		fmt.Printf("Deleting collection: %s\n", collection)
 		if err := qc.DeleteCollection(collection); err != nil {
 			return err
+		}
+
+		// Also remove the per-project incremental indexing state file stored under
+		// ~/.codebase so that the next index run doesn't think nothing changed.
+		if err := indexer.ClearProjectState(projectID); err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: failed to clear local index state: %v\n", err)
 		}
 		fmt.Println("✓ Collection deleted")
 		return nil

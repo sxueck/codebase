@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -56,7 +57,12 @@ func (idx *Indexer) RegisterParser(lang string, p parser.LanguageParser) {
 }
 
 func (idx *Indexer) IndexProject(rootPath string) error {
-	projectID, err := utils.ComputeProjectID(rootPath)
+	normalizedRoot, err := utils.NormalizeProjectRoot(rootPath)
+	if err != nil {
+		return fmt.Errorf("failed to normalize project root: %w", err)
+	}
+
+	projectID, err := utils.ComputeProjectID(normalizedRoot)
 	if err != nil {
 		return fmt.Errorf("failed to compute project id: %w", err)
 	}
@@ -69,7 +75,7 @@ func (idx *Indexer) IndexProject(rootPath string) error {
 	fmt.Printf("→ Project fingerprint: %s\n", shortID)
 	fmt.Printf("→ Using collection: %s\n", idx.collection)
 
-	files, err := utils.GetAllSourceFiles(rootPath)
+	files, err := utils.GetAllSourceFiles(normalizedRoot)
 	if err != nil {
 		return err
 	}
@@ -85,6 +91,7 @@ func (idx *Indexer) IndexProject(rootPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load file hashes: %w", err)
 	}
+	prevHashes = canonicalizeHashKeys(prevHashes, normalizedRoot)
 
 	currentHashes := make(map[string]string, len(files))
 	var changedFiles []string
@@ -95,10 +102,9 @@ func (idx *Indexer) IndexProject(rootPath string) error {
 			fmt.Fprintf(os.Stderr, "✗ Failed to hash %s: %v\n", f, herr)
 			continue
 		}
-		// Normalize path to use forward slashes for consistent comparison
-		normalizedPath := filepath.ToSlash(f)
-		currentHashes[normalizedPath] = hash
-		if prev, ok := prevHashes[normalizedPath]; !ok || prev != hash {
+		key := normalizeFilePath(f)
+		currentHashes[key] = hash
+		if prev, ok := prevHashes[key]; !ok || prev != hash {
 			changedFiles = append(changedFiles, f)
 		}
 	}
@@ -167,8 +173,8 @@ func (idx *Indexer) processFile(path string) error {
 	if idx.collection == "" {
 		return fmt.Errorf("collection name is not set on indexer")
 	}
-	// Normalize path for consistent storage in Qdrant
-	normalizedPath := filepath.ToSlash(path)
+	// Normalize path for consistent storage in Qdrant and stable deletion.
+	normalizedPath := normalizeFilePath(path)
 
 	// For modified files, clear any existing vectors for this file before
 	// re-indexing so that removed functions do not leave stale points.
@@ -355,6 +361,54 @@ func hashFile(path string) (string, error) {
 	return utils.HashContent(string(data)), nil
 }
 
+func normalizeFilePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+
+	abs := path
+	if !filepath.IsAbs(abs) {
+		if a, err := filepath.Abs(abs); err == nil {
+			abs = a
+		}
+	}
+	abs = filepath.Clean(abs)
+	normalized := filepath.ToSlash(abs)
+	if runtime.GOOS == "windows" {
+		normalized = strings.ToLower(normalized)
+	}
+	return normalized
+}
+
+func canonicalizeHashKeys(hashes map[string]string, normalizedRoot string) map[string]string {
+	if len(hashes) == 0 {
+		return hashes
+	}
+	root := strings.TrimSpace(normalizedRoot)
+	if root == "" {
+		return hashes
+	}
+	root = filepath.Clean(root)
+	if runtime.GOOS == "windows" {
+		root = strings.ToLower(root)
+	}
+
+	out := make(map[string]string, len(hashes))
+	for k, v := range hashes {
+		key := strings.TrimSpace(k)
+		if key == "" {
+			continue
+		}
+		p := filepath.FromSlash(key)
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(root, p)
+		}
+		out[normalizeFilePath(p)] = v
+	}
+	return out
+}
+
 // loadFileHashes loads the last-seen file hash map from disk. It is stored as
 // a JSON file under ~/.codebase scoped by the project ID.
 func loadFileHashes(projectID string) (map[string]string, error) {
@@ -404,6 +458,22 @@ func fileHashStatePath(projectID string) (string, error) {
 	}
 	fileName := fmt.Sprintf("%s_file_hashes.json", projectID)
 	return filepath.Join(stateDir, fileName), nil
+}
+
+// ClearProjectState removes any local on-disk state associated with a project.
+// Currently this is the file-hash map used for incremental indexing.
+func ClearProjectState(projectID string) error {
+	statePath, err := fileHashStatePath(projectID)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(statePath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // deleteFilePoints removes all vectors in Qdrant whose payload file_path

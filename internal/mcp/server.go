@@ -326,11 +326,6 @@ func (s *Server) handleSearchCode(args json.RawMessage) (interface{}, error) {
 	return s.simpleSearchWithCollection(input.Query, input.TopK, collection)
 }
 
-// simpleSearch performs basic semantic search without query planning
-func (s *Server) simpleSearch(query string, topK int) (interface{}, error) {
-	return s.simpleSearchWithCollection(query, topK, s.collectionName())
-}
-
 // simpleSearchWithCollection performs basic semantic search on a specific collection
 func (s *Server) simpleSearchWithCollection(query string, topK int, collection string) (interface{}, error) {
 	vec, err := s.embedClient.Embed(query)
@@ -550,9 +545,7 @@ func (s *Server) watchLoop() {
 	}
 }
 
-// runIncrementalIndex invokes the existing IndexProject implementation,
-// which updates changed files and removes vectors for deleted files so
-// that old data does not affect future reads.
+
 func (s *Server) runIncrementalIndex() {
 	if s.indexer == nil || strings.TrimSpace(s.rootDir) == "" {
 		return
