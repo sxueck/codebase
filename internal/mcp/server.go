@@ -238,7 +238,7 @@ func (s *Server) handleToolsList(writer *bufio.Writer, req *JSONRPCRequest) {
 					},
 					"top_k": map[string]interface{}{
 						"type":        "integer",
-						"description": "Maximum number of code snippets to return (default 10). Increase this when you need broader coverage of the relevant implementation (for example, 20–50 when exploring a feature area) and lower it when you only need the single most relevant location.",
+						"description": "Maximum number of code snippets to return (default 4). Increase this when you need broader coverage of the relevant implementation (for example, 5-10 when exploring a feature area) and lower it when you only need the single most relevant location.",
 					},
 					"project_path": map[string]interface{}{
 						"type":        "string",
@@ -309,7 +309,7 @@ func (s *Server) handleSearchCode(args json.RawMessage) (interface{}, error) {
 	}
 
 	if input.TopK == 0 {
-		input.TopK = 10
+		input.TopK = 5
 	}
 
 	// Determine which collection to use based on project_path
