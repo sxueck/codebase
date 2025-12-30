@@ -9,6 +9,7 @@ import (
 	neturl "net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/qdrant/go-client/qdrant"
 	"google.golang.org/grpc"
@@ -22,14 +23,19 @@ type Client struct {
 
 func NewClient() (*Client, error) {
 	addr := config.Get("QDRANT_URL", "qdrant_url")
-	host, port, err := parseQdrantAddress(addr)
+	host, port, useTLS, err := parseQdrantAddress(addr)
 	if err != nil {
 		return nil, err
 	}
 
+	if config.Get("QDRANT_USE_TLS", "qdrant_use_tls") == "true" {
+		useTLS = true
+	}
+
 	cfg := &qdrant.Config{
-		Host: host,
-		Port: port,
+		Host:   host,
+		Port:   port,
+		UseTLS: useTLS,
 	}
 
 	if apiKey := getQdrantAPIKey(); apiKey != "" {
@@ -48,24 +54,29 @@ func NewClient() (*Client, error) {
 	}, nil
 }
 
-func parseQdrantAddress(raw string) (string, int, error) {
+func parseQdrantAddress(raw string) (host string, port int, useTLS bool, err error) {
 	const (
 		defaultHost = "localhost"
 		defaultPort = 6334
 	)
 
 	if strings.TrimSpace(raw) == "" {
-		return defaultHost, defaultPort, nil
+		return defaultHost, defaultPort, false, nil
 	}
 
 	endpoint := strings.TrimSpace(raw)
+	useTLS = false
+
 	if strings.Contains(endpoint, "://") {
 		parsed, err := neturl.Parse(endpoint)
 		if err != nil {
-			return "", 0, err
+			return "", 0, false, err
+		}
+		if parsed.Scheme == "https" {
+			useTLS = true
 		}
 		if parsed.Host == "" {
-			return defaultHost, defaultPort, nil
+			return defaultHost, defaultPort, useTLS, nil
 		}
 		endpoint = parsed.Host
 	}
@@ -74,20 +85,24 @@ func parseQdrantAddress(raw string) (string, int, error) {
 	if err != nil {
 		var addrErr *net.AddrError
 		if errors.As(err, &addrErr) && strings.Contains(addrErr.Err, "missing port") {
-			return endpoint, defaultPort, nil
+			// Infer port if missing based on scheme logic if needed, but default is 6334
+			// If https was detected but no port, 6334 is still standard for Qdrant gRPC,
+			// but sometimes 443 is used if behind load balancer.
+			// Let's stick to endpoint as host and default port.
+			return endpoint, defaultPort, useTLS, nil
 		}
-		return "", 0, err
+		return "", 0, false, err
 	}
 
-	port, err := strconv.Atoi(portStr)
+	port, err = strconv.Atoi(portStr)
 	if err != nil {
-		return "", 0, err
+		return "", 0, false, err
 	}
 	if host == "" {
 		host = defaultHost
 	}
 
-	return host, port, nil
+	return host, port, useTLS, nil
 }
 
 func getQdrantAPIKey() string {
@@ -164,30 +179,78 @@ func (c *Client) DeleteCollection(name string) error {
 
 func (c *Client) Upsert(collectionName string, points []*qdrant.PointStruct) error {
 	ctx := context.Background()
-
-	// Set wait=true to ensure operation completes before returning
 	wait := true
-	_, err := c.client.Upsert(ctx, &qdrant.UpsertPoints{
-		CollectionName: collectionName,
-		Points:         points,
-		Wait:           &wait,
-	})
 
-	return err
+	// Split into batches to avoid hitting gRPC message size limits or timeouts
+	const batchSize = 50
+	
+	for i := 0; i < len(points); i += batchSize {
+		end := i + batchSize
+		if end > len(points) {
+			end = len(points)
+		}
+		batch := points[i:end]
+
+		// Retry logic for transient network errors
+		var lastErr error
+		const maxRetries = 3
+		
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			if attempt > 0 {
+				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			}
+			
+			_, lastErr = c.client.Upsert(ctx, &qdrant.UpsertPoints{
+				CollectionName: collectionName,
+				Points:         batch,
+				Wait:           &wait,
+			})
+			
+			if lastErr == nil {
+				break
+			}
+			
+			// If error is not transient (e.g. validatior error), maybe we shouldn't retry?
+			// But "Unavailable" or "Connection Reset" are worth retrying.
+			// Simple check: if it's context canceled, stop.
+			if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
+				return lastErr
+			}
+		}
+		
+		if lastErr != nil {
+			return fmt.Errorf("failed to upsert batch (offset %d) after %d retries: %w", i, maxRetries, lastErr)
+		}
+	}
+
+	return nil
 }
 
 func (c *Client) Search(collectionName string, vector []float32, limit uint64) ([]*qdrant.ScoredPoint, error) {
 	ctx := context.Background()
-	resp, err := c.client.Search(ctx, &qdrant.SearchPoints{
-		CollectionName: collectionName,
-		Vector:         vector,
-		Limit:          limit,
-		WithPayload:    &qdrant.WithPayloadSelector{SelectorOptions: &qdrant.WithPayloadSelector_Enable{Enable: true}},
-	})
-	if err != nil {
-		return nil, err
+	
+	var resp *qdrant.SearchResponse
+	var err error
+	const maxRetries = 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+		}
+
+		resp, err = c.client.Search(ctx, &qdrant.SearchPoints{
+			CollectionName: collectionName,
+			Vector:         vector,
+			Limit:          limit,
+			WithPayload:    &qdrant.WithPayloadSelector{SelectorOptions: &qdrant.WithPayloadSelector_Enable{Enable: true}},
+		})
+		
+		if err == nil {
+			return resp.Result, nil
+		}
 	}
-	return resp.Result, nil
+	
+	return nil, err
 }
 
 func (c *Client) Scroll(collectionName string, limit uint32, offset *qdrant.PointId) ([]*qdrant.RetrievedPoint, *qdrant.PointId, error) {

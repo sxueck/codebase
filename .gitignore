@@ -8,3 +8,6 @@ vendor/
 dist/
 build/
 .claude
+.gocache
+.idea
+.DS_Store

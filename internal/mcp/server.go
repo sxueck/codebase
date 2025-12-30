@@ -228,21 +228,21 @@ func (s *Server) handleToolsList(writer *bufio.Writer, req *JSONRPCRequest) {
 	tools := []map[string]interface{}{
 		{
 			"name":        "codebase-retrieval",
-			"description": "Primary MCP for this repo. Before attempting ANY code retrieval, requirement analysis, or contextual grounding for a user request, you must call this tool once. It performs semantic code search over the indexed repository so answers stay anchored to real code instead of assumptions.",
+			"description": "Semantic code search tool. Use this tool to find relevant code snippets, functions, or context within the repository when you need to answer user queries with specific code references. It helps anchor your responses to the actual codebase.",
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"query": map[string]interface{}{
 						"type":        "string",
-						"description": "Natural language description of what you need to inspect in this repo. Always populate this and call the tool first whenever (a) a user asks for code search, diffing, or refactors, or (b) you need to understand user requirements by locating related context in the codebase. Include specific symbols/files/features to maximize recall.",
+						"description": "Natural language description of what you need to inspect in this repo. Include specific symbols, file names, or features to maximize recall.",
 					},
 					"top_k": map[string]interface{}{
 						"type":        "integer",
-						"description": "Maximum number of code snippets to return (default 4). Increase this when you need broader coverage of the relevant implementation (for example, 5-10 when exploring a feature area) and lower it when you only need the single most relevant location.",
+						"description": "Maximum number of code snippets to return (default 5).",
 					},
 					"project_path": map[string]interface{}{
 						"type":        "string",
-						"description": "Optional absolute path to the project root directory to search. If not provided, uses the default directory specified when starting the MCP server. Use this to search across different projects or repositories.",
+						"description": "Optional absolute path to the project root directory to search. If not provided, uses the default directory specified when starting the MCP server.",
 					},
 				},
 				"required": []string{"query"},
@@ -312,32 +312,144 @@ func (s *Server) handleSearchCode(args json.RawMessage) (interface{}, error) {
 		input.TopK = 5
 	}
 
-	// Determine which collection to use based on project_path
+	// Determine which collection and root to use based on project_path
 	collection := s.collectionName()
+	searchRoot := s.rootDir
+
 	if input.ProjectPath != "" {
-		projectID, err := utils.ComputeProjectID(input.ProjectPath)
+		normalized, err := utils.NormalizeProjectRoot(input.ProjectPath)
 		if err != nil {
 			return nil, fmt.Errorf("invalid project_path: %w", err)
+		}
+		searchRoot = normalized
+
+		projectID, err := utils.ComputeProjectID(searchRoot)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compute project ID: %w", err)
 		}
 		collection = indexer.CollectionName(projectID)
 	}
 
 	// Perform simple semantic search without query planning
-	return s.simpleSearchWithCollection(input.Query, input.TopK, collection)
+	return s.simpleSearchWithCollection(input.Query, input.TopK, collection, searchRoot)
 }
 
 // simpleSearchWithCollection performs basic semantic search on a specific collection
-func (s *Server) simpleSearchWithCollection(query string, topK int, collection string) (interface{}, error) {
+// It uses a diversity-aware strategy: fetching more candidates and prioritizing unique files
+// to ensure a broader coverage of the codebase.
+func (s *Server) simpleSearchWithCollection(query string, topK int, collection string, rootPath string) (interface{}, error) {
 	vec, err := s.embedClient.Embed(query)
 	if err != nil {
 		return nil, err
 	}
 
-	results, err := s.qdrantClient.Search(collection, vec, uint64(topK))
+	// Strategy: Fetch more candidates (3x topK) to allow for filtering and diversity.
+	// This helps avoid crowding the results with many chunks from a single relevant file.
+	searchLimit := topK * 3
+	// Ensure a reasonable minimum to have enough candidates for reranking
+	if searchLimit < 20 {
+		searchLimit = 20
+	}
+
+	results, err := s.qdrantClient.Search(collection, vec, uint64(searchLimit))
 	if err != nil {
 		return nil, err
 	}
-	return results, nil
+
+	type candidate struct {
+		payload  map[string]interface{}
+		score    float32
+		fileKey  string
+		relPath  string
+	}
+
+	var candidates []candidate
+
+	// Pre-process results to check file existence and path normalization
+	for _, hit := range results {
+		payload := qdrant.PayloadToMap(hit.Payload)
+		filePath, ok := payload["file_path"].(string)
+		if !ok {
+			continue
+		}
+
+		// Handle both absolute and relative paths in the index
+		checkPath := filePath
+		if !filepath.IsAbs(checkPath) {
+			checkPath = filepath.Join(rootPath, checkPath)
+		}
+
+		// Verify file exists on disk to avoid returning deleted files.
+		// If Stat fails for any reason, skip the hit to avoid leaking unusable paths.
+		if _, err := os.Stat(checkPath); err != nil {
+			continue
+		}
+
+		// Use a normalized absolute path as a stable grouping key so the diversity
+		// filter doesn't break if the index mixes relative and absolute paths.
+		fileKey := checkPath
+		if abs, err := filepath.Abs(checkPath); err == nil {
+			fileKey = abs
+		}
+		fileKey = filepath.Clean(fileKey)
+
+		// Calculate relative path for display
+		relPath := filePath
+		if rel, err := filepath.Rel(rootPath, checkPath); err == nil {
+			relPath = rel
+		}
+
+		candidates = append(candidates, candidate{
+			payload:  payload,
+			score:    hit.Score,
+			fileKey:  fileKey,
+			relPath:  relPath,
+		})
+	}
+
+	var finalResults []map[string]interface{}
+	fileCounts := make(map[string]int)
+	maxChunksPerFilePass1 := 1 // Pass 1: enforce unique-file-first
+	usedIndices := make(map[int]bool)
+
+	// Pass 1: Diversity focused - take at most 1 chunk per file to maximize coverage.
+	for i, item := range candidates {
+		if len(finalResults) >= topK {
+			break
+		}
+		if fileCounts[item.fileKey] < maxChunksPerFilePass1 {
+			finalResults = append(finalResults, map[string]interface{}{
+				"file_path":  item.relPath,
+				"start_line": item.payload["start_line"],
+				"end_line":   item.payload["end_line"],
+				"content":    item.payload["content"],
+				"score":      item.score,
+			})
+			fileCounts[item.fileKey]++
+			usedIndices[i] = true
+		}
+	}
+
+	// Pass 2: Fill remaining slots if needed (relax diversity constraint)
+	if len(finalResults) < topK {
+		for i, item := range candidates {
+			if len(finalResults) >= topK {
+				break
+			}
+			if !usedIndices[i] {
+				finalResults = append(finalResults, map[string]interface{}{
+					"file_path":  item.relPath,
+					"start_line": item.payload["start_line"],
+					"end_line":   item.payload["end_line"],
+					"content":    item.payload["content"],
+					"score":      item.score,
+				})
+				usedIndices[i] = true
+			}
+		}
+	}
+
+	return finalResults, nil
 }
 
 func (s *Server) writeResponse(writer *bufio.Writer, id interface{}, result interface{}) {
