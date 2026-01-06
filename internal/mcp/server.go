@@ -228,7 +228,7 @@ func (s *Server) handleToolsList(writer *bufio.Writer, req *JSONRPCRequest) {
 	tools := []map[string]interface{}{
 		{
 			"name":        "codebase-retrieval",
-			"description": "Semantic code search tool. Use this tool to find relevant code snippets, functions, or context within the repository when you need to answer user queries with specific code references. It helps anchor your responses to the actual codebase.",
+			"description": "Semantic code search tool for intelligent context gathering. IMPORTANT: Use this tool FIRST before performing any grep/search operations or reading files when you need to understand code context. This tool provides semantic search that returns the most relevant code snippets across the entire repository, significantly reducing the need for multiple grep calls. It's especially effective for: 1) Understanding how a feature is implemented, 2) Finding related code across multiple files, 3) Locating specific functions or patterns, 4) Gathering context before making changes. Always prefer this tool over manual grep searches for exploratory tasks.",
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
